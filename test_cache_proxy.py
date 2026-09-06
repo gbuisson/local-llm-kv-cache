@@ -32,6 +32,7 @@ class FakeLlamaHandler(BaseHTTPRequestHandler):
     restore_failed = False
     restore_tokens = 10
     slot_tokens = 0
+    save_tokens = 10
 
     def do_GET(self):
         if self.path == "/slots":
@@ -54,8 +55,8 @@ class FakeLlamaHandler(BaseHTTPRequestHandler):
             filename = payload["filename"]
             self.saved.append(filename)
             Path(self.cache_dir, filename).write_bytes(b"snapshot")
-            type(self).slot_tokens = 10
-            self._json({"n_saved": 10})
+            type(self).slot_tokens = self.save_tokens
+            self._json({"n_saved": self.save_tokens})
             return
         self._json({"status": "ok"})
 
@@ -201,6 +202,7 @@ class CacheProxyTests(unittest.TestCase):
         FakeLlamaHandler.restore_failed = False
         FakeLlamaHandler.restore_tokens = 10
         FakeLlamaHandler.slot_tokens = 0
+        FakeLlamaHandler.save_tokens = 10
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), FakeLlamaHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.proxy = LlamaCacheProxy(
@@ -538,6 +540,59 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertEqual(hot_plan.slot_id, 0)
         self.assertEqual(FakeLlamaHandler.saved[-1].endswith(".tmp"), True)
+
+    def test_finish_skips_resave_when_context_barely_grew(self):
+        """A snapshot is only worth rewriting once enough new context exists."""
+        _, first_plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(first_plan, 200)
+        writes_after_first = len(FakeLlamaHandler.saved)
+
+        # Second turn adds a handful of tokens: far below min_save_growth.
+        # Set after prepare(), since a restore resets the fake slot's counter.
+        _, second_plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 10 + 5
+        self.proxy.finish(second_plan, 200)
+
+        self.assertEqual(len(FakeLlamaHandler.saved), writes_after_first)
+
+    def test_finish_resaves_once_context_grew_enough(self):
+        _, first_plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(first_plan, 200)
+        writes_after_first = len(FakeLlamaHandler.saved)
+
+        # The slot itself now holds enough new context to be worth rewriting.
+        grown = 10 + self.proxy.min_save_growth
+        _, second_plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = grown
+        FakeLlamaHandler.save_tokens = grown
+        self.proxy.finish(second_plan, 200)
+
+        self.assertEqual(len(FakeLlamaHandler.saved), writes_after_first + 1)
+
+    def test_skipped_resave_keeps_session_hot(self):
+        """Skipping a write must not drop the affinity that makes it hot."""
+        _, first_plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy.finish(first_plan, 200)
+
+        _, second_plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(second_plan, 200)
+
+        # Affinity survives the skipped write, and n_tokens still describes the
+        # snapshot actually on disk so growth is measured against that file.
+        state = self.proxy.session_states["session-a"]
+        self.assertEqual(state.slot_id, 0)
+        self.assertEqual(state.prefix_key, cache_key(self.body))
+        self.assertEqual(state.n_tokens, 10)
+
+    def test_finish_always_saves_first_snapshot_for_a_session(self):
+        """With no prior snapshot there is nothing to compare against."""
+        FakeLlamaHandler.save_tokens = 1
+        _, plan = self.proxy.prepare(self.body, "session-new")
+
+        self.proxy.finish(plan, 200)
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
 
     def test_prefix_seed_skips_when_no_safe_idle_slot_exists(self):
         self.proxy.session_states["session-a"] = SlotState(1, cache_key(self.body), 10)

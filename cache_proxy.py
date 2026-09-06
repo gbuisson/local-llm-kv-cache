@@ -70,6 +70,7 @@ class LlamaCacheProxy:
         wait_seconds: float = 120.0,
         enable_prefix_seeding: bool = True,
         prefix_seed_delay_seconds: float = 2.0,
+        min_save_growth: int = 4096,
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme != "http" or not parsed.hostname:
@@ -83,6 +84,7 @@ class LlamaCacheProxy:
         self.wait_seconds = wait_seconds
         self.enable_prefix_seeding = enable_prefix_seeding
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
+        self.min_save_growth = max(0, int(min_save_growth))
         self.operation_lock = threading.Lock()
         self.session_states: dict[str, SlotState] = {}
         self.prefix_seed_lock = threading.Lock()
@@ -143,12 +145,45 @@ class LlamaCacheProxy:
         slot_id = self._resolve_slot(plan)
         if plan.slot_id is None:
             self._forget_slot(slot_id)
+        previous = self.session_states.get(plan.session_id)
+        if self._should_skip_save(previous, plan, slot_id):
+            # Keep the affinity (so the session stays hot) and keep reporting the
+            # token count of the snapshot actually on disk, so growth is measured
+            # against that file rather than drifting turn by turn.
+            self.session_states[plan.session_id] = replace(previous, slot_id=slot_id)
+            return
         n_saved = self._save(slot_id, plan.session_file)
         state = SlotState(slot_id, plan.prefix_key, n_saved)
         self.session_states[plan.session_id] = state
         if not plan.prefix_was_present:
             self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
         self._prune()
+
+    def _should_skip_save(
+        self, previous: SlotState | None, plan: SnapshotPlan, slot_id: int
+    ) -> bool:
+        """Rewriting a multi-GB snapshot is only worth it for real new context.
+
+        Snapshots were previously rewritten after every request, which on this
+        host meant ~14 writes per restore that ever served a request. Skipping
+        near-identical rewrites keeps the restores while dropping most of the IO.
+        """
+        if self.min_save_growth <= 0 or previous is None:
+            return False
+        if previous.prefix_key != plan.prefix_key:
+            return False
+        if not plan.session_file.exists():
+            return False
+        current_tokens = self._slot_tokens(slot_id)
+        if current_tokens is None:
+            return False
+        return current_tokens - previous.n_tokens < self.min_save_growth
+
+    def _slot_tokens(self, slot_id: int) -> int | None:
+        for slot in self._slots():
+            if int(slot.get("id", -1)) == slot_id:
+                return int(slot.get("n_prompt_tokens") or 0)
+        return None
 
     def _hot_state(self, state: SlotState | None, prefix_key: str) -> SlotState | None:
         if state is None or state.prefix_key != prefix_key:
@@ -511,6 +546,7 @@ def main() -> None:
         max_cache_gib=float(os.environ.get("PI_LLAMA_CACHE_MAX_GIB", "12")),
         wait_seconds=float(os.environ.get("PI_LLAMA_CACHE_WAIT_SECONDS", "120")),
         prefix_seed_delay_seconds=float(os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_DELAY", "2")),
+        min_save_growth=int(os.environ.get("PI_LLAMA_CACHE_MIN_SAVE_GROWTH", "4096")),
     )
     ProxyHandler.proxy = proxy
     host = os.environ.get("PI_LLAMA_CACHE_HOST", "127.0.0.1")
