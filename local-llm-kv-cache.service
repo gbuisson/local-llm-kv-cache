@@ -14,6 +14,10 @@ Environment=PI_LLAMA_CACHE_DIR=%h/.llama-slot-cache
 Environment=PI_LLAMA_CACHE_MAX_GIB=120
 Environment=PI_LLAMA_CACHE_WAIT_SECONDS=120
 Environment=PI_LLAMA_CACHE_PREFIX_SEED_DELAY=2
+# Only rewrite a session snapshot once the slot holds this many new tokens.
+# Snapshots are multi-GB, and unconditional rewrites produced ~14 writes per
+# restore that ever served a request. 0 restores the old always-write behaviour.
+Environment=PI_LLAMA_CACHE_MIN_SAVE_GROWTH=4096
 Restart=always
 RestartSec=3
 
