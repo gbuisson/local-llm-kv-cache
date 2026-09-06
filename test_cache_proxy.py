@@ -1020,6 +1020,22 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertFalse(snapshot.exists())
 
+    def test_prune_removes_abandoned_tmp_snapshots(self):
+        """Interrupted saves leave *.bin.tmp behind; prune must reclaim them."""
+        proxy = LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=self.tempdir.name,
+            max_cache_gib=0,
+            wait_seconds=1,
+            enable_prefix_seeding=False,
+        )
+        leftover = Path(self.tempdir.name, "local-llm-session-old.bin.tmp")
+        leftover.write_bytes(b"partial snapshot")
+
+        proxy._prune()
+
+        self.assertFalse(leftover.exists())
+
     def test_body_session_id_is_used_for_affinity(self):
         previous_proxy = getattr(ProxyHandler, "proxy", None)
         capturing_proxy = CapturingProxy()

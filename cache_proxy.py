@@ -391,10 +391,13 @@ class LlamaCacheProxy:
         return n_saved
 
     def _prune(self) -> None:
-        files = sorted(
-            self.cache_dir.glob("local-llm-*.bin"),
-            key=lambda path: path.stat().st_mtime,
-        )
+        # *.bin.tmp are partial saves abandoned by an interrupted _save; they
+        # never become reusable snapshots, so prune must reclaim them too.
+        candidates = [
+            *self.cache_dir.glob("local-llm-*.bin"),
+            *self.cache_dir.glob("local-llm-*.bin.tmp"),
+        ]
+        files = sorted(candidates, key=lambda path: path.stat().st_mtime)
         total = sum(path.stat().st_size for path in files)
         while total > self.max_cache_bytes and files:
             victim = files.pop(0)
