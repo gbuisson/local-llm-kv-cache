@@ -34,7 +34,7 @@ curl -fsS http://127.0.0.1:18082/health
 | `PI_LLAMA_CACHE_NAMESPACE` | `default` | Invalidates snapshots across model, llama.cpp, context, or template deployments. Use a stable deployment fingerprint. |
 | `PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING` | `true` | Allows best-effort prefix seeding. Disable it for a one-slot (`-np 1`) server. |
 | `PI_LLAMA_CACHE_SAVE_POLICY` | `all` | `all` saves every successful response. `terminal` defers `finish_reason=tool_calls`, then saves on a terminal response, before eviction, or during clean shutdown. |
-| `PI_LLAMA_CACHE_REQUIRE_SESSION_ID` | `false` | Rejects anonymous chat requests. Recommended when conversation isolation is required. |
+| `PI_LLAMA_CACHE_REQUIRE_SESSION_ID` | `false` | Rejects anonymous cache-managed text chat requests. Media chat requests remain allowed without affinity because they run serialized and unmanaged after flushing dirty state. Recommended when conversation isolation is required. |
 | `PI_LLAMA_CACHE_MAX_GIB` | `12` | LRU disk budget for snapshot files. Successful restores and hot reuse refresh recency. |
 
 `terminal` is intended for tool-heavy agents. Deferred state remains in the hot llama.cpp slot and is flushed before any cold request can overwrite an owned slot. If slot metadata cannot be verified, the proxy fails safe and saves immediately.

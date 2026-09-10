@@ -1356,6 +1356,7 @@ class CacheProxyTests(unittest.TestCase):
     def test_proxy_handler_rejects_invalid_json_and_forwards_media(self):
         previous_proxy = getattr(ProxyHandler, "proxy", None)
         proxy = CapturingProxy()
+        proxy.require_session_id = True
         ProxyHandler.proxy = proxy
         server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -1380,6 +1381,7 @@ class CacheProxyTests(unittest.TestCase):
             connection.close()
             self.assertEqual(proxy.forwarded[-1][0], "POST")
             self.assertEqual(proxy.uncached_reasons, ["before_media"])
+            self.assertEqual(proxy.session_ids, [])
         finally:
             server.shutdown()
             server.server_close()

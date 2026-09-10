@@ -935,6 +935,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         header_session_id = _session_id(self)
         body_session_id = _body_session_id(body)
         body = _without_proxy_affinity_fields(body)
+        if _has_media(body):
+            try:
+                with self.proxy.foreground_operation():
+                    self.proxy.prepare_uncached("before_media")
+                    self.proxy.forward(self, "POST", self.path, json.dumps(body).encode("utf-8"))
+            except (RuntimeError, TimeoutError, OSError) as error:
+                self._send_upstream_error(error)
+            return
         explicit_session_id = header_session_id or body_session_id
         if explicit_session_id is None and self.proxy.require_session_id:
             self.send_error(400, "a stable session ID is required")
@@ -945,14 +953,6 @@ class ProxyHandler(BaseHTTPRequestHandler):
             session_ref=_session_ref(session_id),
             source="header" if header_session_id else "body" if body_session_id else "anonymous",
         )
-        if _has_media(body):
-            try:
-                with self.proxy.foreground_operation():
-                    self.proxy.prepare_uncached("before_media")
-                    self.proxy.forward(self, "POST", self.path, json.dumps(body).encode("utf-8"))
-            except (RuntimeError, TimeoutError, OSError) as error:
-                self._send_upstream_error(error)
-            return
         try:
             with self.proxy.foreground_operation():
                 request, plan = self.proxy.prepare(body, session_id)
