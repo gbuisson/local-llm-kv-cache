@@ -71,6 +71,79 @@ def _is_slot_admin_path(path: str) -> bool:
     return normalized == "/slots" or normalized.startswith("/slots/")
 
 
+_ROUTE_ALIASES = {
+    ("GET", "/v1/props"): "/props",
+    ("HEAD", "/v1/props"): "/props",
+    ("POST", "/v1/tokenize"): "/tokenize",
+    ("POST", "/v1/detokenize"): "/detokenize",
+    ("POST", "/v1/apply-template"): "/apply-template",
+}
+_NON_EVICTING_POST_PATHS = frozenset(
+    {
+        "/tokenize",
+        "/detokenize",
+        "/apply-template",
+        "/v1/responses/input_tokens",
+        "/v1/chat/completions/input_tokens",
+        "/v1/messages/count_tokens",
+        "/v1/chat/completions/control",
+    }
+)
+_UNMANAGED_INFERENCE_POST_PATHS = frozenset(
+    {
+        "/completion",
+        "/v1/completions",
+        "/infill",
+        "/embedding",
+        "/embeddings",
+        "/v1/embeddings",
+        "/rerank",
+        "/reranking",
+        "/v1/rerank",
+        "/v1/responses",
+        "/v1/messages",
+    }
+)
+_ADMIN_PATHS = frozenset({"/tools", "/lora-adapters"})
+
+
+def _upstream_path(method: str, path: str) -> str:
+    raw_path, separator, query = path.partition("?")
+    alias = _ROUTE_ALIASES.get((method, raw_path.rstrip("/")))
+    if alias is None:
+        return path
+    return alias + (f"?{query}" if separator else "")
+
+
+def _normalized_path(path: str) -> str:
+    return path.partition("?")[0].rstrip("/")
+
+
+def _is_non_evicting_post_path(path: str) -> bool:
+    normalized = _normalized_path(_upstream_path("POST", path))
+    return normalized in _NON_EVICTING_POST_PATHS
+
+
+def _is_known_post_path(path: str) -> bool:
+    normalized = _normalized_path(_upstream_path("POST", path))
+    return (
+        normalized == "/v1/chat/completions"
+        or normalized in _NON_EVICTING_POST_PATHS
+        or normalized in _UNMANAGED_INFERENCE_POST_PATHS
+    )
+
+
+def _is_blocked_path(method: str, path: str) -> bool:
+    normalized = _normalized_path(path)
+    if _is_slot_admin_path(path) or normalized in _ADMIN_PATHS:
+        return True
+    if method in {"POST", "DELETE"} and (
+        normalized == "/props" or normalized == "/models" or normalized.startswith("/models/")
+    ):
+        return True
+    return method == "DELETE"
+
+
 @dataclass(frozen=True)
 class CompletionMetadata:
     finish_reason: str | None = None
@@ -551,15 +624,20 @@ class LlamaCacheProxy:
     ) -> ForwardResult:
         upstream = HTTPConnection(self.upstream_host, self.upstream_port, timeout=1200)
         headers = self._forward_headers(handler)
+        is_head = method == "HEAD"
         upstream.request(method, f"{self.upstream_prefix}{path}", body=body, headers=headers)
         response = upstream.getresponse()
         setattr(handler, "_proxy_response_started", True)
         handler.send_response(response.status, response.reason)
         for key, value in response.getheaders():
-            if key.lower() in HOP_BY_HOP_HEADERS:
+            normalized_key = key.lower()
+            if normalized_key in HOP_BY_HOP_HEADERS and not (
+                is_head and normalized_key == "content-length"
+            ):
                 continue
             handler.send_header(key, value)
-        handler.send_header("Transfer-Encoding", "chunked")
+        if not is_head:
+            handler.send_header("Transfer-Encoding", "chunked")
         handler.end_headers()
         metadata_buffer = bytearray()
         try:
@@ -570,12 +648,14 @@ class LlamaCacheProxy:
                 metadata_buffer.extend(chunk)
                 if len(metadata_buffer) > MAX_METADATA_BYTES:
                     del metadata_buffer[:-MAX_METADATA_BYTES]
-                handler.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
-                handler.wfile.write(chunk)
-                handler.wfile.write(b"\r\n")
+                if not is_head:
+                    handler.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                    handler.wfile.write(chunk)
+                    handler.wfile.write(b"\r\n")
+                    handler.wfile.flush()
+            if not is_head:
+                handler.wfile.write(b"0\r\n\r\n")
                 handler.wfile.flush()
-            handler.wfile.write(b"0\r\n\r\n")
-            handler.wfile.flush()
             return ForwardResult(response.status, _completion_metadata([bytes(metadata_buffer)]))
         except (BrokenPipeError, ConnectionResetError):
             LOGGER.debug("client disconnected while proxying %s %s", method, path)
@@ -585,7 +665,20 @@ class LlamaCacheProxy:
 
     def _forward_headers(self, handler: BaseHTTPRequestHandler) -> dict[str, str]:
         headers = {"Content-Type": handler.headers.get("Content-Type", "application/json")}
-        for name in ("Authorization", "Accept", "User-Agent"):
+        for name in (
+            "Authorization",
+            "Accept",
+            "User-Agent",
+            "Origin",
+            "Access-Control-Request-Method",
+            "Access-Control-Request-Headers",
+            "X-Api-Key",
+            "Anthropic-Version",
+            "Anthropic-Beta",
+            "OpenAI-Organization",
+            "OpenAI-Project",
+            "Idempotency-Key",
+        ):
             value = handler.headers.get(name)
             if value:
                 headers[name] = value
@@ -765,11 +858,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
     proxy: LlamaCacheProxy
 
     def do_GET(self) -> None:
-        if _is_slot_admin_path(self.path):
+        if _is_blocked_path("GET", self.path):
             self.send_error(404)
             return
         try:
-            self.proxy.forward(self, "GET", self.path, b"")
+            self.proxy.forward(self, "GET", _upstream_path("GET", self.path), b"")
+        except (RuntimeError, TimeoutError, OSError) as error:
+            self._send_upstream_error(error)
+
+    def do_HEAD(self) -> None:
+        if _is_blocked_path("HEAD", self.path):
+            self.send_error(404)
+            return
+        try:
+            self.proxy.forward(self, "HEAD", _upstream_path("HEAD", self.path), b"")
+        except (RuntimeError, TimeoutError, OSError) as error:
+            self._send_upstream_error(error)
+
+    def do_OPTIONS(self) -> None:
+        if _is_blocked_path("OPTIONS", self.path):
+            self.send_error(404)
+            return
+        try:
+            self.proxy.forward(self, "OPTIONS", self.path, b"")
         except (RuntimeError, TimeoutError, OSError) as error:
             self._send_upstream_error(error)
 
@@ -779,16 +890,37 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_error(503, f"upstream unavailable: {error}")
 
     def do_POST(self) -> None:
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length)
-        if _is_slot_admin_path(self.path):
+        if _is_blocked_path("POST", self.path):
+            self.close_connection = True
             self.send_error(404)
             return
-        if self.path.rstrip("/") != "/v1/chat/completions":
+        if not _is_known_post_path(self.path):
+            self.close_connection = True
+            self.send_error(404)
+            return
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            self.send_error(400, "Content-Length must be an integer")
+            return
+        if length < 0:
+            self.close_connection = True
+            self.send_error(400, "Content-Length must not be negative")
+            return
+        raw = self.rfile.read(length)
+        upstream_path = _upstream_path("POST", self.path)
+        if _is_non_evicting_post_path(self.path):
+            try:
+                self.proxy.forward(self, "POST", upstream_path, raw)
+            except (RuntimeError, TimeoutError, OSError) as error:
+                self._send_upstream_error(error)
+            return
+        if _normalized_path(self.path) != "/v1/chat/completions":
             try:
                 with self.proxy.foreground_operation():
                     self.proxy.prepare_uncached("before_unmanaged_post")
-                    self.proxy.forward(self, "POST", self.path, raw)
+                    self.proxy.forward(self, "POST", upstream_path, raw)
             except (RuntimeError, TimeoutError, OSError) as error:
                 self._send_upstream_error(error)
             return
@@ -841,6 +973,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     LOGGER.exception("response succeeded but snapshot finalization failed")
         except (RuntimeError, TimeoutError, OSError) as error:
             self._send_upstream_error(error)
+
+    def do_DELETE(self) -> None:
+        self.close_connection = True
+        self.send_error(404)
 
     def log_message(self, format: str, *args: Any) -> None:
         LOGGER.info("%s - %s", self.address_string(), format % args)

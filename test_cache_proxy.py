@@ -116,7 +116,8 @@ class CapturingProxy:
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(raw)))
         handler.end_headers()
-        handler.wfile.write(raw)
+        if _args[0] != "HEAD":
+            handler.wfile.write(raw)
         return ForwardResult(200)
 
     def finish(self, *_args, **_kwargs):
@@ -969,7 +970,7 @@ class CacheProxyTests(unittest.TestCase):
     def test_forward_streams_body_and_filters_hop_by_hop_headers(self):
         response = FakeResponse(
             status=201,
-            headers=[("Content-Type", "text/plain"), ("Connection", "close")],
+            headers=[("Content-Type", "text/plain"), ("Content-Length", "2"), ("Connection", "close")],
             chunks=[b"ok"],
         )
         connection = FakeConnection("host", 80, response=response)
@@ -990,8 +991,27 @@ class CacheProxyTests(unittest.TestCase):
         self.assertEqual(connection.requests[0][2], b"body")
         self.assertIn(("Content-Type", "text/plain"), handler.sent_headers)
         self.assertNotIn(("Connection", "close"), handler.sent_headers)
+        self.assertNotIn(("Content-Length", "2"), handler.sent_headers)
         self.assertIn(("Transfer-Encoding", "chunked"), handler.sent_headers)
         self.assertEqual(b"".join(handler.wfile.data), b"2\r\nok\r\n0\r\n\r\n")
+        self.assertTrue(connection.closed)
+
+    def test_forward_head_preserves_content_length_without_writing_a_body(self):
+        response = FakeResponse(
+            status=200,
+            headers=[("Content-Type", "application/json"), ("Content-Length", "2")],
+            chunks=[b"{}"],
+        )
+        connection = FakeConnection("host", 80, response=response)
+        handler = RecordingHandler()
+
+        with patch("cache_proxy.HTTPConnection", return_value=connection):
+            result = self.proxy.forward(handler, "HEAD", "/props", b"")
+
+        self.assertEqual(result.status, 200)
+        self.assertIn(("Content-Length", "2"), handler.sent_headers)
+        self.assertNotIn(("Transfer-Encoding", "chunked"), handler.sent_headers)
+        self.assertEqual(handler.wfile.data, [])
         self.assertTrue(connection.closed)
 
     def test_forward_bounds_completion_metadata_buffer(self):
@@ -1073,6 +1093,15 @@ class CacheProxyTests(unittest.TestCase):
                 "Authorization": "token",
                 "Accept": "application/json",
                 "User-Agent": "agent",
+                "Origin": "https://client.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+                "X-Api-Key": "anthropic-token",
+                "Anthropic-Version": "2023-06-01",
+                "Anthropic-Beta": "test-beta",
+                "OpenAI-Organization": "org-test",
+                "OpenAI-Project": "project-test",
+                "Idempotency-Key": "request-test",
             }
         )
 
@@ -1085,6 +1114,15 @@ class CacheProxyTests(unittest.TestCase):
                 "Authorization": "token",
                 "Accept": "application/json",
                 "User-Agent": "agent",
+                "Origin": "https://client.example",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "authorization,content-type",
+                "X-Api-Key": "anthropic-token",
+                "Anthropic-Version": "2023-06-01",
+                "Anthropic-Beta": "test-beta",
+                "OpenAI-Organization": "org-test",
+                "OpenAI-Project": "project-test",
+                "Idempotency-Key": "request-test",
             },
         )
 
@@ -1162,22 +1200,120 @@ class CacheProxyTests(unittest.TestCase):
             response.read()
             self.assertEqual(response.status, 200)
             connection.close()
+            self.assertEqual(proxy.forwarded[-1][1], "/health")
 
             connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
-            connection.request("POST", "/v1/models", body=b"{}", headers={"Content-Type": "application/json"})
+            connection.request("GET", "/v1/props?format=json")
             response = connection.getresponse()
             response.read()
             self.assertEqual(response.status, 200)
             connection.close()
-            self.assertEqual(proxy.uncached_reasons, ["before_unmanaged_post"])
+            self.assertEqual(proxy.forwarded[-1][1], "/props?format=json")
+
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            connection.request("HEAD", "/v1/props")
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+            connection.close()
+            self.assertEqual(proxy.forwarded[-1][0:2], ("HEAD", "/props"))
+
+            connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+            connection.request("OPTIONS", "/v1/models")
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 200)
+            connection.close()
+            self.assertEqual(proxy.forwarded[-1][0:2], ("OPTIONS", "/v1/models"))
+
+            for requested_path, upstream_path in (
+                ("/v1/tokenize", "/tokenize"),
+                ("/v1/detokenize", "/detokenize"),
+                ("/v1/apply-template", "/apply-template"),
+                ("/v1/responses/input_tokens", "/v1/responses/input_tokens"),
+                ("/v1/chat/completions/input_tokens", "/v1/chat/completions/input_tokens"),
+                ("/v1/messages/count_tokens", "/v1/messages/count_tokens"),
+                ("/v1/chat/completions/control", "/v1/chat/completions/control"),
+            ):
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request(
+                    "POST",
+                    requested_path,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                connection.close()
+                self.assertEqual(proxy.forwarded[-1][1], upstream_path)
+            self.assertEqual(proxy.uncached_reasons, [])
+
+            unmanaged_paths = (
+                "/completion",
+                "/v1/completions",
+                "/infill",
+                "/embedding",
+                "/embeddings",
+                "/v1/embeddings",
+                "/rerank",
+                "/reranking",
+                "/v1/rerank",
+                "/v1/responses",
+                "/v1/messages",
+            )
+            for unmanaged_path in unmanaged_paths:
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request(
+                    "POST",
+                    unmanaged_path,
+                    body=b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                connection.close()
+                self.assertEqual(proxy.forwarded[-1][1], unmanaged_path)
+            self.assertEqual(
+                proxy.uncached_reasons, ["before_unmanaged_post"] * len(unmanaged_paths)
+            )
 
             forwarded_before = list(proxy.forwarded)
-            for method, path in (("GET", "/slots"), ("POST", "/slots/0?action=save")):
+            for method, path in (
+                ("GET", "/slots"),
+                ("HEAD", "/slots"),
+                ("OPTIONS", "/slots/0"),
+                ("POST", "/slots/0?action=save"),
+                ("GET", "/tools"),
+                ("GET", "/lora-adapters"),
+                ("POST", "/props"),
+                ("POST", "/lora-adapters"),
+                ("POST", "/models"),
+                ("POST", "/models/load"),
+                ("POST", "/models/unload"),
+                ("DELETE", "/models?model=test"),
+                ("DELETE", "/future-resource"),
+                ("POST", "/future-admin-route"),
+            ):
                 connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
                 connection.request(method, path, body=b"{}" if method == "POST" else None)
                 response = connection.getresponse()
                 response.read()
                 self.assertEqual(response.status, 404)
+                connection.close()
+            self.assertEqual(proxy.forwarded, forwarded_before)
+
+            for content_length in ("not-a-number", "-1"):
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request(
+                    "POST",
+                    "/v1/completions",
+                    headers={"Content-Length": content_length},
+                )
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 400)
                 connection.close()
             self.assertEqual(proxy.forwarded, forwarded_before)
         finally:
@@ -1194,7 +1330,13 @@ class CacheProxyTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            for method, path in (("GET", "/health"), ("POST", "/v1/models")):
+            for method, path in (
+                ("GET", "/health"),
+                ("HEAD", "/health"),
+                ("OPTIONS", "/v1/models"),
+                ("POST", "/v1/completions"),
+                ("POST", "/v1/tokenize"),
+            ):
                 connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
                 body = b"{}" if method == "POST" else None
                 headers = {"Content-Type": "application/json"} if body is not None else {}

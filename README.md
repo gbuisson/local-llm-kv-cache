@@ -41,6 +41,19 @@ curl -fsS http://127.0.0.1:18082/health
 
 Explicit affinity is accepted from `session_id`, `conversation_id`, or `prompt_cache_key` either at the JSON body root or in an `extra_body` object, and from `X-Session-Affinity`, `X-Session-Id`, `X-Conversation-Id`, `X-Pi-Session-Id`, `X-OpenCode-Session`, or `X-Client-Request-Id` headers. Affinity fields are removed before forwarding upstream.
 
+The public route contract is explicit and fail-closed:
+
+| Class | Routes | Slot behavior |
+|---|---|---|
+| Session cache | `POST /v1/chat/completions` | Session-affine hot/SSD KV lifecycle |
+| Utility/control | `POST /tokenize`, `/detokenize`, `/apply-template`, token-count routes, and `/v1/chat/completions/control` | Forward without flushing or evicting KV |
+| Unmanaged inference | completions, responses, embeddings, infill, reranking, and Anthropic messages routes | Flush dirty state and reset ownership before forwarding |
+| Monitoring/model metadata | regular `GET`, `HEAD`, and `OPTIONS` routes | Transparent passthrough; no slot mutation |
+| Administration | `/slots`, LoRA/tools administration, mutable `/props`, model load/unload/download, and all `DELETE` requests | `404`, never forwarded |
+| Unknown `POST` | any route outside the allowlist | `404`, never forwarded |
+
+For clients that consistently prefix llama.cpp utility routes with `/v1`, the proxy maps `GET`/`HEAD /v1/props` to `/props` and maps `POST /v1/tokenize`, `/v1/detokenize`, and `/v1/apply-template` to their native unprefixed endpoints. `HEAD` suppresses the upstream response body, while `OPTIONS` and its CORS preflight request headers pass through unchanged.
+
 Operational events are emitted as compact JSON. Session identifiers and prompts are never logged; `session_ref` is a truncated SHA-256 reference suitable for correlation.
 
 ### Context compaction
