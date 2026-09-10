@@ -10,9 +10,11 @@ disk snapshots because their prompt prefix is not reusable.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
+import signal
 import threading
 import time
 from contextlib import contextmanager
@@ -39,6 +41,90 @@ HOP_BY_HOP_HEADERS = {
     "transfer-encoding",
     "upgrade",
 }
+MAX_METADATA_BYTES = 1024 * 1024
+
+
+def _session_ref(session_id: str) -> str:
+    """Return a pseudonymous, log-safe reference for a client session."""
+    return hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _log_event(event: str, *, level: int = logging.INFO, **fields: Any) -> None:
+    payload = {"event": event, **{key: value for key, value in fields.items() if value is not None}}
+    LOGGER.log(level, "%s", json.dumps(payload, sort_keys=True, separators=(",", ":")))
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _is_slot_admin_path(path: str) -> bool:
+    normalized = path.partition("?")[0].rstrip("/")
+    return normalized == "/slots" or normalized.startswith("/slots/")
+
+
+@dataclass(frozen=True)
+class CompletionMetadata:
+    finish_reason: str | None = None
+    cached_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class ForwardResult:
+    status: int
+    metadata: CompletionMetadata = field(default_factory=CompletionMetadata)
+
+
+def _metadata_from_object(value: Any) -> CompletionMetadata:
+    if not isinstance(value, dict):
+        return CompletionMetadata()
+    finish_reason = None
+    choices = value.get("choices")
+    if not isinstance(choices, list):
+        choices = []
+    for choice in choices:
+        if isinstance(choice, dict) and isinstance(choice.get("finish_reason"), str):
+            finish_reason = choice["finish_reason"]
+    cached_tokens = None
+    usage = value.get("usage")
+    if isinstance(usage, dict):
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict) and isinstance(details.get("cached_tokens"), int):
+            cached_tokens = details["cached_tokens"]
+    return CompletionMetadata(finish_reason, cached_tokens)
+
+
+def _completion_metadata(chunks: list[bytes]) -> CompletionMetadata:
+    raw = b"".join(chunks)
+    try:
+        return _metadata_from_object(json.loads(raw or b"{}"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        pass
+
+    result = CompletionMetadata()
+    for line in raw.splitlines():
+        if not line.startswith(b"data:"):
+            continue
+        payload = line[5:].strip()
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            current = _metadata_from_object(json.loads(payload))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        result = CompletionMetadata(
+            current.finish_reason or result.finish_reason,
+            current.cached_tokens if current.cached_tokens is not None else result.cached_tokens,
+        )
+    return result
 
 
 @dataclass(frozen=True)
@@ -59,6 +145,8 @@ class SlotState:
     slot_id: int
     prefix_key: str
     n_tokens: int
+    session_file: Path | None = None
+    dirty: bool = False
 
 
 class LlamaCacheProxy:
@@ -70,6 +158,8 @@ class LlamaCacheProxy:
         wait_seconds: float = 120.0,
         enable_prefix_seeding: bool = True,
         prefix_seed_delay_seconds: float = 2.0,
+        save_policy: str = "all",
+        require_session_id: bool = False,
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme != "http" or not parsed.hostname:
@@ -78,39 +168,62 @@ class LlamaCacheProxy:
         self.upstream_port = parsed.port or 80
         self.upstream_prefix = parsed.path.rstrip("/")
         self.cache_dir = Path(cache_dir or DEFAULT_CACHE_DIR)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
+        self.cache_dir.chmod(0o700)
         self.max_cache_bytes = int(max_cache_gib * 1024**3)
         self.wait_seconds = wait_seconds
         self.enable_prefix_seeding = enable_prefix_seeding
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
+        if save_policy not in {"all", "terminal"}:
+            raise ValueError("save_policy must be 'all' or 'terminal'")
+        self.save_policy = save_policy
+        self.require_session_id = require_session_id
         self.operation_lock = threading.Lock()
         self.session_states: dict[str, SlotState] = {}
         self.prefix_seed_lock = threading.Lock()
         self.prefix_seeds_in_flight: set[Path] = set()
         self.foreground_waiters = 0
         self.foreground_waiters_lock = threading.Lock()
+        self._prune()
 
     def prepare(self, body: dict[str, Any], session_id: str) -> tuple[dict[str, Any], SnapshotPlan]:
         prefix_key = cache_key(body)
         session_file = self.cache_dir / cache_filename(session_id, body, "session")
         prefix_file = self.cache_dir / cache_filename("prefix", body, "prefix")
         prefix_payload = build_prefix_payload(body)
+        session_ref = _session_ref(session_id)
         hot_state = self._hot_state(self.session_states.get(session_id), prefix_key)
         restored_source = None
         candidate_slot_id = None
         slot_task_ids: dict[int, int] = {}
         if hot_state is not None:
             slot_id = hot_state.slot_id
-            LOGGER.info("reusing hot session %s in slot %d", session_id, slot_id)
+            self._touch_snapshot(session_file)
+            _log_event("cache_hit", layer="hot", session_ref=session_ref, slot_id=slot_id)
         else:
             hot_state = None
+            # A native cold request may choose any idle slot. Persist every dirty
+            # owner before allowing llama.cpp to overwrite one.
+            self._flush_dirty_states("before_eviction")
             candidate_slot_id = self._wait_for_idle_slot()
             sources = tuple(path for path in (session_file, prefix_file) if path.exists())
             if sources:
                 self._forget_slot(candidate_slot_id)
-                restored_source = self._restore_first_available(candidate_slot_id, sources)
-            slot_id = None
-            slot_task_ids = self._slot_task_ids()
+                restored_source = self._restore_first_available(
+                    candidate_slot_id, sources, session_ref=session_ref
+                )
+            if restored_source is None:
+                _log_event("cache_miss", session_ref=session_ref, slot_id=candidate_slot_id)
+            else:
+                _log_event(
+                    "cache_hit",
+                    layer="session" if restored_source == session_file else "prefix",
+                    session_ref=session_ref,
+                    slot_id=candidate_slot_id,
+                )
+            slot_id = candidate_slot_id if restored_source is not None else None
+            if slot_id is None:
+                slot_task_ids = self._slot_task_ids()
         plan = SnapshotPlan(
             session_id=session_id,
             slot_id=slot_id,
@@ -124,31 +237,167 @@ class LlamaCacheProxy:
         )
         return with_slot_cache(body, slot_id), plan
 
-    def _restore_first_available(self, slot_id: int, sources: tuple[Path, ...]) -> Path | None:
+    @staticmethod
+    def _touch_snapshot(source: Path) -> int | None:
+        if not source.exists():
+            return None
+        try:
+            source.touch()
+            return source.stat().st_size
+        except OSError as error:
+            _log_event(
+                "snapshot_touch_failed",
+                level=logging.WARNING,
+                filename=source.name,
+                error_type=type(error).__name__,
+            )
+            return None
+
+    def prepare_uncached(self, reason: str = "before_uncached") -> None:
+        """Protect dirty slots before a request that bypasses snapshot tracking."""
+        self._flush_dirty_states(reason)
+        invalidated = len(self.session_states)
+        self.session_states.clear()
+        _log_event("slot_ownership_reset", reason=reason, invalidated_sessions=invalidated)
+
+    def _restore_first_available(
+        self,
+        slot_id: int,
+        sources: tuple[Path, ...],
+        session_ref: str | None = None,
+    ) -> Path | None:
         for source in sources:
             if not source.exists():
                 continue
+            started = time.monotonic()
             try:
                 n_restored = self._restore(slot_id, source)
-            except RuntimeError as error:
-                LOGGER.warning("could not restore %s: %s; continuing without disk restore", source.name, error)
+            except (RuntimeError, TimeoutError, OSError) as error:
+                _log_event(
+                    "snapshot_restore_failed",
+                    level=logging.WARNING,
+                    session_ref=session_ref,
+                    filename=source.name,
+                    slot_id=slot_id,
+                    error_type=type(error).__name__,
+                )
                 continue
-            LOGGER.info("restored %s into slot %d (%s tokens)", source.name, slot_id, n_restored)
+            snapshot_bytes = self._touch_snapshot(source)
+            _log_event(
+                "snapshot_restore",
+                session_ref=session_ref,
+                filename=source.name,
+                slot_id=slot_id,
+                tokens=n_restored,
+                duration_ms=round((time.monotonic() - started) * 1000, 3),
+                snapshot_bytes=snapshot_bytes,
+            )
             return source
         return None
 
-    def finish(self, plan: SnapshotPlan, status: int) -> None:
+    def finish(
+        self,
+        plan: SnapshotPlan,
+        status: int,
+        finish_reason: str | None = None,
+        cached_tokens: int | None = None,
+    ) -> None:
         if status < 200 or status >= 300:
             return
         slot_id = self._resolve_slot(plan)
         if plan.slot_id is None:
             self._forget_slot(slot_id)
-        n_saved = self._save(slot_id, plan.session_file)
-        state = SlotState(slot_id, plan.prefix_key, n_saved)
+
+        session_ref = _session_ref(plan.session_id)
+        defer = self.save_policy == "terminal" and finish_reason == "tool_calls"
+        did_save = False
+        if defer:
+            n_tokens = self._slot_token_count(slot_id)
+            if n_tokens > 0:
+                state = SlotState(slot_id, plan.prefix_key, n_tokens, plan.session_file, True)
+                _log_event(
+                    "snapshot_deferred",
+                    session_ref=session_ref,
+                    slot_id=slot_id,
+                    tokens=n_tokens,
+                    finish_reason=finish_reason,
+                    cached_tokens=cached_tokens,
+                )
+            else:
+                # Unknown slot metadata must fail safe: persist instead of risking
+                # eviction of an uncheckpointed conversation.
+                n_saved = self._save(
+                    slot_id,
+                    plan.session_file,
+                    reason="metadata_fallback",
+                    session_ref=session_ref,
+                )
+                state = SlotState(slot_id, plan.prefix_key, n_saved, plan.session_file, False)
+                did_save = True
+        else:
+            n_saved = self._save(
+                slot_id,
+                plan.session_file,
+                reason="response_complete",
+                session_ref=session_ref,
+            )
+            state = SlotState(slot_id, plan.prefix_key, n_saved, plan.session_file, False)
+            did_save = True
         self.session_states[plan.session_id] = state
+        _log_event(
+            "request_complete",
+            session_ref=session_ref,
+            slot_id=slot_id,
+            finish_reason=finish_reason,
+            cached_tokens=cached_tokens,
+            snapshot_saved=did_save,
+        )
         if not plan.prefix_was_present:
             self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
-        self._prune()
+        if did_save:
+            self._prune()
+
+    def _slot_token_count(self, slot_id: int) -> int:
+        try:
+            slots = self._slots()
+        except (RuntimeError, TimeoutError, OSError, TypeError, ValueError) as error:
+            _log_event(
+                "slot_metadata_unavailable",
+                level=logging.WARNING,
+                slot_id=slot_id,
+                error_type=type(error).__name__,
+            )
+            return 0
+        for slot in slots:
+            if int(slot.get("id", -1)) == slot_id and not slot.get("is_processing"):
+                return int(slot.get("n_prompt_tokens") or 0)
+        return 0
+
+    def _flush_dirty_states(self, reason: str) -> None:
+        for session_id, state in list(self.session_states.items()):
+            if not state.dirty or state.session_file is None:
+                continue
+            session_ref = _session_ref(session_id)
+            n_saved = self._save(
+                state.slot_id,
+                state.session_file,
+                reason=reason,
+                session_ref=session_ref,
+            )
+            self.session_states[session_id] = replace(state, n_tokens=n_saved, dirty=False)
+            _log_event(
+                "snapshot_flush",
+                session_ref=session_ref,
+                slot_id=state.slot_id,
+                filename=state.session_file.name,
+                reason=reason,
+                tokens=n_saved,
+            )
+
+    def flush_dirty(self, reason: str = "shutdown") -> None:
+        with self.foreground_operation():
+            self._flush_dirty_states(reason)
+            self._prune()
 
     def _hot_state(self, state: SlotState | None, prefix_key: str) -> SlotState | None:
         if state is None or state.prefix_key != prefix_key:
@@ -244,7 +493,18 @@ class LlamaCacheProxy:
     def _resolve_slot(self, plan: SnapshotPlan) -> int:
         if plan.slot_id is not None:
             return plan.slot_id
-        slots = [slot for slot in self._slots() if not slot.get("is_processing")]
+        try:
+            slots = [slot for slot in self._slots() if not slot.get("is_processing")]
+        except (RuntimeError, TimeoutError, OSError, TypeError, ValueError) as error:
+            if plan.candidate_slot_id is None:
+                raise
+            _log_event(
+                "slot_resolution_fallback",
+                level=logging.WARNING,
+                slot_id=plan.candidate_slot_id,
+                error_type=type(error).__name__,
+            )
+            return plan.candidate_slot_id
         changed = [
             slot
             for slot in slots
@@ -282,7 +542,13 @@ class LlamaCacheProxy:
         finally:
             self.operation_lock.release()
 
-    def forward(self, handler: BaseHTTPRequestHandler, method: str, path: str, body: bytes) -> int:
+    def forward(
+        self,
+        handler: BaseHTTPRequestHandler,
+        method: str,
+        path: str,
+        body: bytes,
+    ) -> ForwardResult:
         upstream = HTTPConnection(self.upstream_host, self.upstream_port, timeout=1200)
         headers = self._forward_headers(handler)
         upstream.request(method, f"{self.upstream_prefix}{path}", body=body, headers=headers)
@@ -295,21 +561,25 @@ class LlamaCacheProxy:
             handler.send_header(key, value)
         handler.send_header("Transfer-Encoding", "chunked")
         handler.end_headers()
+        metadata_buffer = bytearray()
         try:
             while True:
                 chunk = response.read(64 * 1024)
                 if not chunk:
                     break
+                metadata_buffer.extend(chunk)
+                if len(metadata_buffer) > MAX_METADATA_BYTES:
+                    del metadata_buffer[:-MAX_METADATA_BYTES]
                 handler.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
                 handler.wfile.write(chunk)
                 handler.wfile.write(b"\r\n")
                 handler.wfile.flush()
             handler.wfile.write(b"0\r\n\r\n")
             handler.wfile.flush()
-            return response.status
+            return ForwardResult(response.status, _completion_metadata([bytes(metadata_buffer)]))
         except (BrokenPipeError, ConnectionResetError):
             LOGGER.debug("client disconnected while proxying %s %s", method, path)
-            return response.status
+            return ForwardResult(response.status, _completion_metadata([bytes(metadata_buffer)]))
         finally:
             upstream.close()
 
@@ -374,20 +644,46 @@ class LlamaCacheProxy:
             raise RuntimeError(f"llama restored no tokens from {filename.name}")
         return n_restored
 
-    def _save(self, slot_id: int, target: Path) -> int:
+    def _save(
+        self,
+        slot_id: int,
+        target: Path,
+        reason: str | None = None,
+        session_ref: str | None = None,
+    ) -> int:
+        started = time.monotonic()
         temporary = target.with_suffix(target.suffix + ".tmp")
         temporary.unlink(missing_ok=True)
-        result = self._json_request(
-            "POST",
-            f"/slots/{slot_id}?action=save",
-            {"filename": temporary.name},
-        )
-        if int(result.get("n_saved") or 0) <= 0 or not temporary.exists():
-            temporary.unlink(missing_ok=True)
-            raise RuntimeError(f"llama saved no tokens for slot {slot_id}")
-        temporary.replace(target)
+        try:
+            result = self._json_request(
+                "POST",
+                f"/slots/{slot_id}?action=save",
+                {"filename": temporary.name},
+            )
+            if int(result.get("n_saved") or 0) <= 0 or not temporary.exists():
+                raise RuntimeError(f"llama saved no tokens for slot {slot_id}")
+            temporary.replace(target)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError as error:
+                _log_event(
+                    "snapshot_temp_cleanup_failed",
+                    level=logging.WARNING,
+                    filename=temporary.name,
+                    error_type=type(error).__name__,
+                )
         n_saved = int(result["n_saved"])
-        LOGGER.info("saved slot %d -> %s (%s tokens)", slot_id, target.name, n_saved)
+        _log_event(
+            "snapshot_save",
+            filename=target.name,
+            slot_id=slot_id,
+            tokens=n_saved,
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+            snapshot_bytes=target.stat().st_size,
+            reason=reason,
+            session_ref=session_ref,
+        )
         return n_saved
 
     def _prune(self) -> None:
@@ -401,11 +697,23 @@ class LlamaCacheProxy:
             size = victim.stat().st_size
             victim.unlink(missing_ok=True)
             total -= size
-            LOGGER.info("pruned %s (%d bytes)", victim.name, size)
+            _log_event(
+                "snapshot_prune",
+                filename=victim.name,
+                snapshot_bytes=size,
+                cache_bytes=total,
+            )
 
 
 def _session_id(handler: BaseHTTPRequestHandler) -> str | None:
-    for header in ("X-Session-Affinity", "X-Pi-Session-Id", "X-Client-Request-Id"):
+    for header in (
+        "X-Session-Affinity",
+        "X-Session-Id",
+        "X-Conversation-Id",
+        "X-Pi-Session-Id",
+        "X-OpenCode-Session",
+        "X-Client-Request-Id",
+    ):
         value = handler.headers.get(header)
         if value:
             return value.strip()
@@ -413,17 +721,28 @@ def _session_id(handler: BaseHTTPRequestHandler) -> str | None:
 
 
 def _body_session_id(body: dict[str, Any]) -> str | None:
-    for field in ("session_id", "prompt_cache_key"):
-        value = body.get(field)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
+    containers = [body]
+    extra_body = body.get("extra_body")
+    if isinstance(extra_body, dict):
+        containers.append(extra_body)
+    for container in containers:
+        for affinity_field in ("session_id", "conversation_id", "prompt_cache_key"):
+            value = container.get(affinity_field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
     return None
 
 
 def _without_proxy_affinity_fields(body: dict[str, Any]) -> dict[str, Any]:
     request = copy.deepcopy(body)
-    request.pop("session_id", None)
-    request.pop("prompt_cache_key", None)
+    for affinity_field in ("session_id", "conversation_id", "prompt_cache_key"):
+        request.pop(affinity_field, None)
+    extra_body = request.get("extra_body")
+    if isinstance(extra_body, dict):
+        for affinity_field in ("session_id", "conversation_id", "prompt_cache_key"):
+            extra_body.pop(affinity_field, None)
+        if not extra_body:
+            request.pop("extra_body")
     return request
 
 
@@ -446,6 +765,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
     proxy: LlamaCacheProxy
 
     def do_GET(self) -> None:
+        if _is_slot_admin_path(self.path):
+            self.send_error(404)
+            return
         try:
             self.proxy.forward(self, "GET", self.path, b"")
         except (RuntimeError, TimeoutError, OSError) as error:
@@ -459,9 +781,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
+        if _is_slot_admin_path(self.path):
+            self.send_error(404)
+            return
         if self.path.rstrip("/") != "/v1/chat/completions":
             try:
-                self.proxy.forward(self, "POST", self.path, raw)
+                with self.proxy.foreground_operation():
+                    self.proxy.prepare_uncached("before_unmanaged_post")
+                    self.proxy.forward(self, "POST", self.path, raw)
             except (RuntimeError, TimeoutError, OSError) as error:
                 self._send_upstream_error(error)
             return
@@ -473,21 +800,43 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if not isinstance(body, dict):
             self.send_error(400, "request body must be a JSON object")
             return
+        header_session_id = _session_id(self)
         body_session_id = _body_session_id(body)
         body = _without_proxy_affinity_fields(body)
-        session_id = _session_id(self) or body_session_id or _anonymous_session_id(body)
+        explicit_session_id = header_session_id or body_session_id
+        if explicit_session_id is None and self.proxy.require_session_id:
+            self.send_error(400, "a stable session ID is required")
+            return
+        session_id = explicit_session_id or _anonymous_session_id(body)
+        _log_event(
+            "session_resolve",
+            session_ref=_session_ref(session_id),
+            source="header" if header_session_id else "body" if body_session_id else "anonymous",
+        )
         if _has_media(body):
             try:
-                self.proxy.forward(self, "POST", self.path, json.dumps(body).encode("utf-8"))
+                with self.proxy.foreground_operation():
+                    self.proxy.prepare_uncached("before_media")
+                    self.proxy.forward(self, "POST", self.path, json.dumps(body).encode("utf-8"))
             except (RuntimeError, TimeoutError, OSError) as error:
                 self._send_upstream_error(error)
             return
         try:
             with self.proxy.foreground_operation():
                 request, plan = self.proxy.prepare(body, session_id)
-                status = self.proxy.forward(self, "POST", self.path, json.dumps(request).encode("utf-8"))
+                result = self.proxy.forward(
+                    self,
+                    "POST",
+                    self.path,
+                    json.dumps(request).encode("utf-8"),
+                )
                 try:
-                    self.proxy.finish(plan, status)
+                    self.proxy.finish(
+                        plan,
+                        result.status,
+                        finish_reason=result.metadata.finish_reason,
+                        cached_tokens=result.metadata.cached_tokens,
+                    )
                 except Exception:
                     LOGGER.exception("response succeeded but snapshot finalization failed")
         except (RuntimeError, TimeoutError, OSError) as error:
@@ -507,18 +856,32 @@ def main() -> None:
         cache_dir=os.environ.get("PI_LLAMA_CACHE_DIR", DEFAULT_CACHE_DIR),
         max_cache_gib=float(os.environ.get("PI_LLAMA_CACHE_MAX_GIB", "12")),
         wait_seconds=float(os.environ.get("PI_LLAMA_CACHE_WAIT_SECONDS", "120")),
+        enable_prefix_seeding=_env_bool("PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING", True),
         prefix_seed_delay_seconds=float(os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_DELAY", "2")),
+        save_policy=os.environ.get("PI_LLAMA_CACHE_SAVE_POLICY", "all").strip().lower(),
+        require_session_id=_env_bool("PI_LLAMA_CACHE_REQUIRE_SESSION_ID", False),
     )
     ProxyHandler.proxy = proxy
     host = os.environ.get("PI_LLAMA_CACHE_HOST", "127.0.0.1")
     port = int(os.environ.get("PI_LLAMA_CACHE_PORT", "8081"))
     server = ThreadingHTTPServer((host, port), ProxyHandler)
     LOGGER.info("listening on http://%s:%d -> http://%s:%d", host, port, proxy.upstream_host, proxy.upstream_port)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def stop_on_sigterm(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_on_sigterm)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            proxy.flush_dirty("shutdown")
+        except Exception:
+            LOGGER.exception("failed to flush dirty snapshots during shutdown")
+        signal.signal(signal.SIGTERM, previous_sigterm)
         server.server_close()
 
 

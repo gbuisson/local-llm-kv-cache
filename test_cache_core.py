@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest.mock import patch
 
 from cache_core import (
     build_prefix_payload,
@@ -88,6 +90,14 @@ class CacheCoreTests(unittest.TestCase):
         self.assertRegex(name, r"^local-llm-session-[0-9a-f]{64}\.bin$")
         self.assertNotIn("/", name)
         self.assertEqual(name, cache_filename("session/with spaces", self.body, "session"))
+
+    def test_cache_namespace_invalidates_snapshot_filename(self):
+        with patch.dict(os.environ, {"PI_LLAMA_CACHE_NAMESPACE": "model-a"}):
+            model_a = cache_filename("session", self.body, "session")
+        with patch.dict(os.environ, {"PI_LLAMA_CACHE_NAMESPACE": "model-b"}):
+            model_b = cache_filename("session", self.body, "session")
+
+        self.assertNotEqual(model_a, model_b)
 
 
 if __name__ == "__main__":

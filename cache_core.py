@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from typing import Any
 
 
@@ -24,7 +25,7 @@ _PREFIX_FIELDS = (
     "continue_final_message",
     "parallel_tool_calls",
 )
-_CACHE_FORMAT_VERSION = "2"
+_CACHE_FORMAT_VERSION = "3"
 _SYSTEM_ROLES = {"system", "developer"}
 
 
@@ -55,8 +56,9 @@ def cache_key(body: dict[str, Any]) -> str:
 
 
 def cache_filename(identity: str, body: dict[str, Any], kind: str) -> str:
-    """Build a filesystem-safe filename scoped to an identity and prefix."""
-    material = f"{_CACHE_FORMAT_VERSION}\0{kind}\0{identity}\0{cache_key(body)}".encode("utf-8")
+    """Build a filesystem-safe filename scoped to an identity, namespace, and prefix."""
+    namespace = os.environ.get("PI_LLAMA_CACHE_NAMESPACE", "default").strip() or "default"
+    material = f"{_CACHE_FORMAT_VERSION}\0{namespace}\0{kind}\0{identity}\0{cache_key(body)}".encode("utf-8")
     digest = hashlib.sha256(material).hexdigest()
     return f"local-llm-{kind}-{digest}.bin"
 

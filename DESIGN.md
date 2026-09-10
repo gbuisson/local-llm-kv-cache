@@ -138,7 +138,7 @@ flowchart TD
 ### 4.2 Snapshot 文件名
 
 ~~~text
-snapshot_key = SHA256("2" + kind + identity + prefix_key)
+snapshot_key = SHA256("3" + namespace + kind + identity + prefix_key)
 ~~~
 
 文件格式：
@@ -150,7 +150,7 @@ local-llm-prefix-<hash>.bin
 
 - session 的 identity 是 Pi/Zed session ID；
 - prefix 的 identity 是固定字符串 prefix；
-- 版本号 2 用于让旧格式缓存整体失效。
+- 版本号 3 和 deployment namespace 用于让旧格式或不兼容部署的缓存整体失效。
 
 因此，换 session 会错过具体 session 快照，但仍可能命中同项目的 prefix 快照。
 
@@ -191,7 +191,7 @@ flowchart TD
 代理内存中保存：
 
 ~~~text
-session_id -> slot_id + prefix_key + n_tokens
+session_id -> slot_id + prefix_key + n_tokens + session_file + dirty
 ~~~
 
 只有以下条件同时满足时才直接复用：

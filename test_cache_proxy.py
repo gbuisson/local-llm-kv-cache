@@ -1,6 +1,7 @@
 import json
 import os
 import runpy
+import signal
 import tempfile
 import threading
 import unittest
@@ -13,13 +14,19 @@ from unittest.mock import Mock, patch
 import cache_proxy
 from cache_core import cache_filename, cache_key
 from cache_proxy import (
+    MAX_METADATA_BYTES,
+    CompletionMetadata,
+    ForwardResult,
     LlamaCacheProxy,
     ProxyHandler,
     SnapshotPlan,
     SlotState,
     _anonymous_session_id,
     _body_session_id,
+    _completion_metadata,
+    _env_bool,
     _has_media,
+    _metadata_from_object,
     _session_id,
     _without_proxy_affinity_fields,
 )
@@ -72,6 +79,8 @@ class FakeLlamaHandler(BaseHTTPRequestHandler):
 
 
 class UnavailableProxy:
+    require_session_id = False
+
     @contextmanager
     def foreground_operation(self):
         yield
@@ -81,9 +90,12 @@ class UnavailableProxy:
 
 
 class CapturingProxy:
+    require_session_id = False
+
     def __init__(self):
         self.session_ids = []
         self.forwarded = []
+        self.uncached_reasons = []
 
     @contextmanager
     def foreground_operation(self):
@@ -92,6 +104,9 @@ class CapturingProxy:
     def prepare(self, body, session_id):
         self.session_ids.append(session_id)
         return body, None
+
+    def prepare_uncached(self, reason):
+        self.uncached_reasons.append(reason)
 
     def forward(self, handler, *_args):
         self.forwarded.append(_args)
@@ -102,9 +117,9 @@ class CapturingProxy:
         handler.send_header("Content-Length", str(len(raw)))
         handler.end_headers()
         handler.wfile.write(raw)
-        return 200
+        return ForwardResult(200)
 
-    def finish(self, *_args):
+    def finish(self, *_args, **_kwargs):
         pass
 
 
@@ -114,7 +129,7 @@ class FailingForwardProxy(CapturingProxy):
 
 
 class FinishFailingProxy(CapturingProxy):
-    def finish(self, *_args):
+    def finish(self, *_args, **_kwargs):
         raise RuntimeError("snapshot finalization failed")
 
 
@@ -246,7 +261,7 @@ class CacheProxyTests(unittest.TestCase):
             enable_prefix_seeding=False,
         )
         request, _ = cold_proxy.prepare(other_body, "session-b")
-        self.assertNotIn("id_slot", request)
+        self.assertEqual(request["id_slot"], 0)
         self.assertEqual(len(FakeLlamaHandler.restored), 1)
 
     def test_incompatible_snapshot_falls_back_to_current_slot(self):
@@ -267,7 +282,7 @@ class CacheProxyTests(unittest.TestCase):
             wait_seconds=1,
             enable_prefix_seeding=False,
         )
-        request, plan = cold_proxy.prepare(other_body, "session-b")
+        _request, plan = cold_proxy.prepare(other_body, "session-b")
 
         self.assertEqual(len(FakeLlamaHandler.restored), 1)
 
@@ -296,6 +311,225 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertEqual(self.proxy.session_states, {})
         self.assertEqual(FakeLlamaHandler.saved, [])
+
+    def test_terminal_save_policy_defers_tool_calls_but_flushes_before_eviction(self):
+        self.proxy.save_policy = "terminal"
+        _, plan = self.proxy.prepare(self.body, "private-session-a")
+        FakeLlamaHandler.slot_tokens = 12
+
+        self.proxy.finish(plan, 200, finish_reason="tool_calls")
+
+        state = self.proxy.session_states["private-session-a"]
+        self.assertTrue(state.dirty)
+        self.assertEqual(state.n_tokens, 12)
+        self.assertEqual(FakeLlamaHandler.saved, [])
+
+        next_body = {
+            **self.body,
+            "messages": [self.body["messages"][0], {"role": "user", "content": "session b"}],
+        }
+        self.proxy.prepare(next_body, "private-session-b")
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        self.assertFalse(self.proxy.session_states["private-session-a"].dirty)
+
+    def test_terminal_save_policy_keeps_dirty_session_hot_and_saves_terminal_response(self):
+        self.proxy.save_policy = "terminal"
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(plan, 200, finish_reason="tool_calls")
+
+        request, hot_plan = self.proxy.prepare(self.body, "session-a")
+        self.assertEqual(request["id_slot"], 0)
+        self.assertTrue(self.proxy.session_states["session-a"].dirty)
+
+        FakeLlamaHandler.slot_tokens = 15
+        self.proxy.finish(hot_plan, 200, finish_reason="stop")
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        self.assertFalse(self.proxy.session_states["session-a"].dirty)
+
+    def test_compacted_prompt_with_same_affinity_reuses_only_a_compatible_hot_prefix(self):
+        self.proxy.save_policy = "terminal"
+        _, plan = self.proxy.prepare(self.body, "session-parent")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(plan, 200, finish_reason="tool_calls")
+        compacted = {
+            **self.body,
+            "messages": [
+                self.body["messages"][0],
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+
+        request, compacted_plan = self.proxy.prepare(compacted, "session-parent")
+
+        self.assertEqual(request["id_slot"], 0)
+        self.assertEqual(compacted_plan.prefix_key, plan.prefix_key)
+        self.assertTrue(self.proxy.session_states["session-parent"].dirty)
+        self.assertEqual(FakeLlamaHandler.saved, [])
+
+    def test_compaction_session_rotation_never_restores_parent_snapshot(self):
+        _, parent_plan = self.proxy.prepare(self.body, "session-parent")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(parent_plan, 200, finish_reason="stop")
+        parent_snapshot = parent_plan.session_file
+        compacted = {
+            **self.body,
+            "messages": [
+                self.body["messages"][0],
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+        restored_before = list(FakeLlamaHandler.restored)
+
+        request, child_plan = self.proxy.prepare(compacted, "session-child")
+
+        self.assertNotIn("id_slot", request)
+        self.assertNotEqual(child_plan.session_file, parent_snapshot)
+        self.assertEqual(FakeLlamaHandler.restored, restored_before)
+
+    def test_in_place_compaction_after_eviction_restores_same_session_for_llama_lcp(self):
+        _, parent_plan = self.proxy.prepare(self.body, "session-parent")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(parent_plan, 200, finish_reason="stop")
+        other_body = {
+            **self.body,
+            "messages": [self.body["messages"][0], {"role": "user", "content": "other"}],
+        }
+        _, other_plan = self.proxy.prepare(other_body, "session-other")
+        self.proxy.finish(other_plan, 200, finish_reason="stop")
+        compacted = {
+            **self.body,
+            "messages": [
+                self.body["messages"][0],
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+
+        request, compacted_plan = self.proxy.prepare(compacted, "session-parent")
+
+        self.assertEqual(request["id_slot"], 0)
+        self.assertEqual(compacted_plan.session_file, parent_plan.session_file)
+        self.assertEqual(FakeLlamaHandler.restored[-1], parent_plan.session_file.name)
+
+    def test_compaction_that_changes_stable_prefix_flushes_then_starts_cold(self):
+        self.proxy.save_policy = "terminal"
+        _, plan = self.proxy.prepare(self.body, "session-parent")
+        FakeLlamaHandler.slot_tokens = 12
+        self.proxy.finish(plan, 200, finish_reason="tool_calls")
+        compacted = {
+            **self.body,
+            "messages": [
+                {"role": "system", "content": "new deployment rules"},
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            ],
+        }
+
+        request, compacted_plan = self.proxy.prepare(compacted, "session-parent")
+
+        self.assertNotIn("id_slot", request)
+        self.assertNotEqual(compacted_plan.prefix_key, plan.prefix_key)
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        self.assertFalse(self.proxy.session_states["session-parent"].dirty)
+        self.assertEqual(FakeLlamaHandler.restored, [])
+
+    def test_all_save_policy_still_saves_tool_call_responses(self):
+        self.proxy.save_policy = "all"
+        _, plan = self.proxy.prepare(self.body, "session-a")
+
+        self.proxy.finish(plan, 200, finish_reason="tool_calls")
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+
+    def test_terminal_policy_saves_when_slot_metadata_is_unavailable(self):
+        self.proxy.save_policy = "terminal"
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy._slot_token_count = Mock(return_value=0)
+
+        self.proxy.finish(plan, 200, finish_reason="tool_calls")
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        self.assertFalse(self.proxy.session_states["session-a"].dirty)
+
+    def test_terminal_policy_saves_when_slot_metadata_request_fails(self):
+        self.proxy.save_policy = "terminal"
+        _, plan = self.proxy.prepare(self.body, "session-a")
+        self.proxy._slots = Mock(side_effect=RuntimeError("slots unavailable"))
+
+        self.proxy.finish(plan, 200, finish_reason="tool_calls")
+
+        self.assertEqual(len(FakeLlamaHandler.saved), 1)
+        self.assertFalse(self.proxy.session_states["session-a"].dirty)
+
+    def test_flush_dirty_ignores_clean_or_unpersistable_states(self):
+        self.proxy.session_states = {
+            "clean": SlotState(0, "clean", 10, Path(self.tempdir.name, "clean.bin"), False),
+            "missing-file": SlotState(1, "dirty", 10, None, True),
+        }
+        self.proxy._save = Mock()
+
+        self.proxy._flush_dirty_states("test")
+
+        self.proxy._save.assert_not_called()
+
+    def test_flush_dirty_public_method_persists_dirty_state(self):
+        target = Path(self.tempdir.name, "session.bin")
+        self.proxy.session_states = {
+            "session-a": SlotState(0, "prefix", 12, target, True),
+        }
+
+        self.proxy.flush_dirty("shutdown")
+
+        self.assertFalse(self.proxy.session_states["session-a"].dirty)
+        self.assertTrue(target.exists())
+
+    def test_slot_token_count_handles_mismatch_and_missing_slot(self):
+        self.proxy._slots = Mock(
+            return_value=[
+                {"id": 1, "is_processing": False, "n_prompt_tokens": 7},
+                {"id": 0, "is_processing": True, "n_prompt_tokens": 8},
+            ]
+        )
+        self.assertEqual(self.proxy._slot_token_count(0), 0)
+        self.assertEqual(self.proxy._slot_token_count(2), 0)
+
+    def test_slot_resolution_does_not_guess_without_a_candidate(self):
+        plan = SnapshotPlan(
+            "session-a",
+            None,
+            "prefix",
+            Path(self.tempdir.name, "session.bin"),
+            Path(self.tempdir.name, "prefix.bin"),
+            {},
+            False,
+        )
+        self.proxy._slots = Mock(side_effect=RuntimeError("slots unavailable"))
+
+        with self.assertRaises(RuntimeError):
+            self.proxy._resolve_slot(plan)
+
+    def test_invalid_save_policy_is_rejected(self):
+        with self.assertRaises(ValueError):
+            LlamaCacheProxy(
+                upstream=f"http://127.0.0.1:{self.server.server_port}",
+                cache_dir=self.tempdir.name,
+                save_policy="unsafe",
+            )
+
+    def test_cache_directory_is_private(self):
+        cache_dir = Path(self.tempdir.name, "private-cache")
+
+        LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=str(cache_dir),
+            enable_prefix_seeding=False,
+        )
+
+        self.assertEqual(cache_dir.stat().st_mode & 0o777, 0o700)
 
     def test_finish_does_not_seed_when_prefix_snapshot_is_present(self):
         _, plan = self.proxy.prepare(self.body, "session-a")
@@ -413,7 +647,7 @@ class CacheProxyTests(unittest.TestCase):
 
         request, _ = self.proxy.prepare(self.body, "session-a")
 
-        self.assertNotIn("id_slot", request)
+        self.assertEqual(request["id_slot"], 0)
         self.assertEqual(
             FakeLlamaHandler.restored,
             [cache_filename("session-a", self.body, "session")],
@@ -438,16 +672,20 @@ class CacheProxyTests(unittest.TestCase):
         self.assertIsNone(plan.slot_id)
         self.assertIsNotNone(plan.candidate_slot_id)
 
-    def test_new_session_restores_disk_snapshot_before_native_selection(self):
+    def test_new_session_pins_the_slot_where_its_snapshot_was_restored(self):
         snapshot = Path(self.tempdir.name, cache_filename("session-new", self.body, "session"))
         snapshot.write_bytes(b"snapshot")
         self.proxy._restore_first_available = Mock(return_value=snapshot)
 
         request, plan = self.proxy.prepare(self.body, "session-new")
 
-        self.assertNotIn("id_slot", request)
-        self.assertIsNone(plan.slot_id)
-        self.proxy._restore_first_available.assert_called_once_with(0, (snapshot,))
+        self.assertEqual(request["id_slot"], 0)
+        self.assertEqual(plan.slot_id, 0)
+        self.proxy._restore_first_available.assert_called_once_with(
+            0,
+            (snapshot,),
+            session_ref=cache_proxy._session_ref("session-new"),
+        )
 
     def test_fallback_resolves_slot_changed_by_native_scheduler(self):
         plan = SnapshotPlan(
@@ -519,6 +757,18 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertEqual(restored, existing)
         self.assertEqual(FakeLlamaHandler.restored, ["existing.bin"])
+
+    def test_restore_tries_next_source_after_transport_failure(self):
+        first = Path(self.tempdir.name, "first.bin")
+        second = Path(self.tempdir.name, "second.bin")
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        self.proxy._restore = Mock(side_effect=[TimeoutError("timeout"), 10])
+
+        restored = self.proxy._restore_first_available(0, (first, second))
+
+        self.assertEqual(restored, second)
+        self.assertEqual(self.proxy._restore.call_count, 2)
 
     def test_zero_token_restore_is_treated_as_failure(self):
         source = Path(self.tempdir.name, "empty.bin")
@@ -646,10 +896,31 @@ class CacheProxyTests(unittest.TestCase):
         self.assertEqual(_body_session_id({"prompt_cache_key": " prompt-key "}), "prompt-key")
         self.assertIsNone(_body_session_id({"session_id": 42, "prompt_cache_key": ""}))
 
-        body = {"session_id": "session", "prompt_cache_key": "key", "messages": []}
+        conversation_handler = RecordingHandler(headers={"X-Conversation-Id": "conversation-header"})
+        self.assertEqual(_session_id(conversation_handler), "conversation-header")
+        self.assertEqual(_body_session_id({"conversation_id": "conversation-body"}), "conversation-body")
+        self.assertEqual(
+            _body_session_id({"extra_body": {"session_id": " nested-session "}}),
+            "nested-session",
+        )
+
+        body = {
+            "session_id": "session",
+            "conversation_id": "conversation",
+            "prompt_cache_key": "key",
+            "extra_body": {"session_id": "nested", "keep": "upstream-extension"},
+            "messages": [],
+        }
         stripped = _without_proxy_affinity_fields(body)
-        self.assertEqual(stripped, {"messages": []})
+        self.assertEqual(
+            stripped,
+            {"extra_body": {"keep": "upstream-extension"}, "messages": []},
+        )
         self.assertEqual(body["session_id"], "session")
+        self.assertEqual(
+            _without_proxy_affinity_fields({"extra_body": {"conversation_id": "nested"}}),
+            {},
+        )
 
     def test_media_detection_covers_images_and_message_content(self):
         self.assertTrue(_has_media({"images": ["image-data"]}))
@@ -712,9 +983,9 @@ class CacheProxyTests(unittest.TestCase):
         )
 
         with patch("cache_proxy.HTTPConnection", return_value=connection):
-            status = self.proxy.forward(handler, "POST", "/v1/test", b"body")
+            result = self.proxy.forward(handler, "POST", "/v1/test", b"body")
 
-        self.assertEqual(status, 201)
+        self.assertEqual(result.status, 201)
         self.assertEqual(connection.requests[0][0:2], ("POST", "/v1/test"))
         self.assertEqual(connection.requests[0][2], b"body")
         self.assertIn(("Content-Type", "text/plain"), handler.sent_headers)
@@ -723,15 +994,77 @@ class CacheProxyTests(unittest.TestCase):
         self.assertEqual(b"".join(handler.wfile.data), b"2\r\nok\r\n0\r\n\r\n")
         self.assertTrue(connection.closed)
 
+    def test_forward_bounds_completion_metadata_buffer(self):
+        oversized = b"x" * (MAX_METADATA_BYTES + 1)
+        connection = FakeConnection(
+            "host",
+            80,
+            response=FakeResponse(status=200, chunks=[oversized]),
+        )
+        handler = RecordingHandler()
+
+        with patch("cache_proxy.HTTPConnection", return_value=connection):
+            result = self.proxy.forward(handler, "POST", "/v1/chat/completions", b"{}")
+
+        self.assertEqual(result, ForwardResult(200))
+        self.assertTrue(connection.closed)
+
     def test_forward_returns_status_when_client_disconnects(self):
         connection = FakeConnection("host", 80, response=FakeResponse(status=200, chunks=[b"ok"]))
         handler = RecordingHandler(broken=True)
 
         with patch("cache_proxy.HTTPConnection", return_value=connection):
-            status = self.proxy.forward(handler, "GET", "/health", b"")
+            result = self.proxy.forward(handler, "GET", "/health", b"")
 
-        self.assertEqual(status, 200)
+        self.assertEqual(result.status, 200)
         self.assertTrue(connection.closed)
+
+    def test_completion_metadata_parses_json_and_split_sse_chunks(self):
+        regular = _completion_metadata(
+            [b'{"choices":[{"finish_reason":"stop"}],"usage":{"prompt_tokens_details":{"cached_tokens":42}}}']
+        )
+        self.assertEqual(regular, CompletionMetadata("stop", 42))
+
+        streamed = _completion_metadata(
+            [
+                b'data: {"choices":[{"delta":{"content":"x"},"finish_',
+                b'reason":null}]}\n\ndata: {"choices":[{"delta":{},"finish_reason":"tool_calls"}],',
+                b'"usage":{"prompt_tokens_details":{"cached_tokens":17}}}\n\ndata: [DONE]\n\n',
+            ]
+        )
+        self.assertEqual(streamed, CompletionMetadata("tool_calls", 17))
+
+    def test_completion_metadata_tolerates_non_completion_and_malformed_sse(self):
+        self.assertEqual(_metadata_from_object([]), CompletionMetadata())
+        self.assertEqual(
+            _metadata_from_object(
+                {
+                    "choices": [None, {"finish_reason": None}],
+                    "usage": {"prompt_tokens_details": {"cached_tokens": "not-an-int"}},
+                }
+            ),
+            CompletionMetadata(),
+        )
+        self.assertEqual(_metadata_from_object({"usage": "unknown"}), CompletionMetadata())
+        self.assertEqual(_metadata_from_object({"choices": 1}), CompletionMetadata())
+        self.assertEqual(
+            _completion_metadata(
+                [b"not-json\n\ndata:\n\ndata: [DONE]\n\ndata: {broken}\n\ndata: []\n\n"]
+            ),
+            CompletionMetadata(),
+        )
+
+    def test_boolean_environment_parser_is_strict(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(_env_bool("TEST_BOOLEAN", True))
+        for value in ("1", "true", "YES", " on "):
+            with patch.dict(os.environ, {"TEST_BOOLEAN": value}):
+                self.assertTrue(_env_bool("TEST_BOOLEAN", False))
+        for value in ("0", "false", "NO", " off "):
+            with patch.dict(os.environ, {"TEST_BOOLEAN": value}):
+                self.assertFalse(_env_bool("TEST_BOOLEAN", True))
+        with patch.dict(os.environ, {"TEST_BOOLEAN": "maybe"}), self.assertRaises(ValueError):
+            _env_bool("TEST_BOOLEAN", True)
 
     def test_forward_headers_preserve_supported_request_headers(self):
         handler = RecordingHandler(
@@ -790,9 +1123,36 @@ class CacheProxyTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.proxy._save(0, Path(self.tempdir.name, "session.bin"))
 
+    def test_save_removes_partial_temporary_snapshot_after_transport_failure(self):
+        target = Path(self.tempdir.name, "session.bin")
+
+        def fail_after_writing(_method, _path, payload):
+            Path(self.tempdir.name, payload["filename"]).write_bytes(b"partial")
+            raise TimeoutError("timeout")
+
+        self.proxy._json_request = Mock(side_effect=fail_after_writing)
+
+        with self.assertRaises(TimeoutError):
+            self.proxy._save(0, target)
+
+        self.assertFalse(target.with_suffix(".bin.tmp").exists())
+
+    def test_save_logs_temporary_cleanup_failure_without_hiding_save_error(self):
+        self.proxy._json_request = Mock(return_value={"n_saved": 0})
+
+        with (
+            patch.object(Path, "unlink", side_effect=[None, PermissionError("denied")]),
+            patch.object(cache_proxy.LOGGER, "log") as logger,
+            self.assertRaises(RuntimeError),
+        ):
+            self.proxy._save(0, Path(self.tempdir.name, "session.bin"))
+
+        self.assertIn("snapshot_temp_cleanup_failed", logger.call_args.args[2])
+
     def test_proxy_handler_get_and_non_chat_post_forward_successfully(self):
         previous_proxy = getattr(ProxyHandler, "proxy", None)
-        ProxyHandler.proxy = CapturingProxy()
+        proxy = CapturingProxy()
+        ProxyHandler.proxy = proxy
         server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
@@ -809,6 +1169,17 @@ class CacheProxyTests(unittest.TestCase):
             response.read()
             self.assertEqual(response.status, 200)
             connection.close()
+            self.assertEqual(proxy.uncached_reasons, ["before_unmanaged_post"])
+
+            forwarded_before = list(proxy.forwarded)
+            for method, path in (("GET", "/slots"), ("POST", "/slots/0?action=save")):
+                connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+                connection.request(method, path, body=b"{}" if method == "POST" else None)
+                response = connection.getresponse()
+                response.read()
+                self.assertEqual(response.status, 404)
+                connection.close()
+            self.assertEqual(proxy.forwarded, forwarded_before)
         finally:
             server.shutdown()
             server.server_close()
@@ -866,6 +1237,7 @@ class CacheProxyTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             connection.close()
             self.assertEqual(proxy.forwarded[-1][0], "POST")
+            self.assertEqual(proxy.uncached_reasons, ["before_media"])
         finally:
             server.shutdown()
             server.server_close()
@@ -973,6 +1345,38 @@ class CacheProxyTests(unittest.TestCase):
         self.assertEqual(servers[0].address, ("127.0.0.1", 19082))
         self.assertTrue(servers[0].closed)
 
+    def test_main_handles_sigterm_and_logs_shutdown_flush_failure(self):
+        servers = []
+
+        class SigtermServer:
+            def __init__(self, address, handler):
+                self.address = address
+                self.handler = handler
+                self.closed = False
+                servers.append(self)
+
+            def serve_forever(self):
+                self.handler.proxy.flush_dirty = Mock(side_effect=RuntimeError("disk unavailable"))
+                signal.raise_signal(signal.SIGTERM)
+
+            def server_close(self):
+                self.closed = True
+
+        env = {
+            "PI_LLAMA_CACHE_HOST": "127.0.0.1",
+            "PI_LLAMA_CACHE_PORT": "19083",
+            "PI_LLAMA_CACHE_DIR": self.tempdir.name,
+        }
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch("http.server.ThreadingHTTPServer", SigtermServer),
+            patch.object(cache_proxy.LOGGER, "exception") as exception,
+        ):
+            runpy.run_path(cache_proxy.__file__, run_name="__main__")
+
+        self.assertTrue(servers[0].closed)
+        exception.assert_called_once_with("failed to flush dirty snapshots during shutdown")
+
     def test_upstream_unavailable_returns_503(self):
         previous_proxy = getattr(ProxyHandler, "proxy", None)
         ProxyHandler.proxy = UnavailableProxy()
@@ -1020,6 +1424,40 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertFalse(snapshot.exists())
 
+    def test_restore_refreshes_snapshot_lru_timestamp(self):
+        snapshot = Path(self.tempdir.name, "local-llm-session-old.bin")
+        snapshot.write_bytes(b"snapshot")
+        os.utime(snapshot, (1, 1))
+
+        self.proxy._restore_first_available(0, (snapshot,))
+
+        self.assertGreater(snapshot.stat().st_mtime, 1)
+
+    def test_snapshot_touch_is_best_effort(self):
+        missing = Path(self.tempdir.name, "missing.bin")
+        self.assertIsNone(self.proxy._touch_snapshot(missing))
+
+        snapshot = Path(self.tempdir.name, "snapshot.bin")
+        snapshot.write_bytes(b"snapshot")
+        with (
+            patch.object(Path, "touch", side_effect=PermissionError("read-only")),
+            patch.object(cache_proxy.LOGGER, "log") as log,
+        ):
+            self.assertIsNone(self.proxy._touch_snapshot(snapshot))
+        self.assertIn("snapshot_touch_failed", log.call_args.args[2])
+
+    def test_uncached_request_flushes_dirty_state_and_resets_ownership(self):
+        target = Path(self.tempdir.name, "dirty-session.bin")
+        self.proxy.session_states = {
+            "session-a": SlotState(0, cache_key(self.body), 12, target, True),
+        }
+
+        self.proxy.prepare_uncached("before_media")
+
+        self.assertEqual(self.proxy.session_states, {})
+        self.assertTrue(target.exists())
+        self.assertEqual(FakeLlamaHandler.saved[-1], target.name + ".tmp")
+
     def test_body_session_id_is_used_for_affinity(self):
         previous_proxy = getattr(ProxyHandler, "proxy", None)
         capturing_proxy = CapturingProxy()
@@ -1054,6 +1492,44 @@ class CacheProxyTests(unittest.TestCase):
                 delattr(ProxyHandler, "proxy")
             else:
                 ProxyHandler.proxy = previous_proxy
+
+    def test_required_session_id_rejects_anonymous_chat_request(self):
+        previous_proxy = getattr(ProxyHandler, "proxy", None)
+        capturing_proxy = CapturingProxy()
+        capturing_proxy.require_session_id = True
+        ProxyHandler.proxy = capturing_proxy
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            connection.request(
+                "POST",
+                "/v1/chat/completions",
+                body=json.dumps({"messages": [{"role": "user", "content": "hello"}]}),
+                headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 400)
+            self.assertEqual(capturing_proxy.session_ids, [])
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            if previous_proxy is None:
+                delattr(ProxyHandler, "proxy")
+            else:
+                ProxyHandler.proxy = previous_proxy
+
+    def test_structured_events_never_log_raw_session_id(self):
+        raw_session_id = "private-session-that-must-not-appear"
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            _, plan = self.proxy.prepare(self.body, raw_session_id)
+            self.proxy.finish(plan, 200)
+
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertNotIn(raw_session_id, rendered)
+        self.assertIn(cache_proxy._session_ref(raw_session_id), rendered)
 
     def test_non_object_json_returns_400(self):
         previous_proxy = getattr(ProxyHandler, "proxy", None)

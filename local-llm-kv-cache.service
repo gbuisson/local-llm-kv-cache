@@ -13,7 +13,11 @@ Environment=PI_LLAMA_CACHE_PORT=18082
 Environment=PI_LLAMA_CACHE_DIR=%h/.llama-slot-cache
 Environment=PI_LLAMA_CACHE_MAX_GIB=12
 Environment=PI_LLAMA_CACHE_WAIT_SECONDS=120
+Environment=PI_LLAMA_CACHE_NAMESPACE=default
+Environment=PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=true
 Environment=PI_LLAMA_CACHE_PREFIX_SEED_DELAY=2
+Environment=PI_LLAMA_CACHE_SAVE_POLICY=all
+Environment=PI_LLAMA_CACHE_REQUIRE_SESSION_ID=false
 Restart=always
 RestartSec=3
 

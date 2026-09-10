@@ -17,7 +17,7 @@
 
 ```bash
 mkdir -p ~/server-ops
-git clone https://github.com/xqliu/local-llm-kv-cache.git ~/server-ops/local-llm-kv-cache
+git clone https://github.com/gbuisson/local-llm-kv-cache.git ~/server-ops/local-llm-kv-cache
 mkdir -p ~/.config/systemd/user
 cp ~/server-ops/local-llm-kv-cache/local-llm-kv-cache.service ~/.config/systemd/user/
 systemctl --user daemon-reload
@@ -26,6 +26,30 @@ curl -fsS http://127.0.0.1:18082/health
 ```
 
 如果 llama.cpp 不在 `127.0.0.1:8080`，修改用户 unit 中的 `PI_LLAMA_UPSTREAM`。Pi 和 Zed 的 provider URL 需要指向 `http://127.0.0.1:18082/v1`。
+
+### Production hardening options
+
+| Variable | Default | Purpose |
+|---|---:|---|
+| `PI_LLAMA_CACHE_NAMESPACE` | `default` | Invalidates snapshots across model, llama.cpp, context, or template deployments. Use a stable deployment fingerprint. |
+| `PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING` | `true` | Allows best-effort prefix seeding. Disable it for a one-slot (`-np 1`) server. |
+| `PI_LLAMA_CACHE_SAVE_POLICY` | `all` | `all` saves every successful response. `terminal` defers `finish_reason=tool_calls`, then saves on a terminal response, before eviction, or during clean shutdown. |
+| `PI_LLAMA_CACHE_REQUIRE_SESSION_ID` | `false` | Rejects anonymous chat requests. Recommended when conversation isolation is required. |
+| `PI_LLAMA_CACHE_MAX_GIB` | `12` | LRU disk budget for snapshot files. Successful restores and hot reuse refresh recency. |
+
+`terminal` is intended for tool-heavy agents. Deferred state remains in the hot llama.cpp slot and is flushed before any cold request can overwrite an owned slot. If slot metadata cannot be verified, the proxy fails safe and saves immediately.
+
+Explicit affinity is accepted from `session_id`, `conversation_id`, or `prompt_cache_key` either at the JSON body root or in an `extra_body` object, and from `X-Session-Affinity`, `X-Session-Id`, `X-Conversation-Id`, `X-Pi-Session-Id`, `X-OpenCode-Session`, or `X-Client-Request-Id` headers. Affinity fields are removed before forwarding upstream.
+
+Operational events are emitted as compact JSON. Session identifiers and prompts are never logged; `session_ref` is a truncated SHA-256 reference suitable for correlation.
+
+### Context compaction
+
+A compaction boundary must not blindly continue the longer pre-compaction transcript. Hermes Agent compacts in place by default (`compression_in_place=True`), so its provider-derived affinity remains unchanged. The proxy may reuse the hot slot, or restore that session's latest disk snapshot after eviction; llama.cpp then performs longest-common-prefix matching against the compacted request, discards KV state after the divergence, and prefills the summary and protected tail. This preserves the stable system/developer prefix while replacing the old dynamic history.
+
+Hermes also supports rotation to a child session at `boundary_reason="compression"`. In that mode a provider derived from the Hermes session ID produces a fresh proxy affinity, the parent snapshot remains isolated, and the compacted child starts cold unless a compatible prefix snapshot is available.
+
+If compaction changes the stable system/developer prefix, the proxy flushes any dirty state and starts cold rather than restoring an incompatible session snapshot. Production validation should cover both hot in-place compaction and in-place compaction after the slot was evicted, because the latter exercises checkpoint restore followed by LCP truncation.
 
 ## 解决的问题
 
@@ -107,7 +131,7 @@ prefix_key = SHA256(canonical_json(prefix_payload))
 磁盘文件名还会加入缓存版本、缓存类型和身份：
 
 ```text
-snapshot_key = SHA256("2" + kind + identity + prefix_key)
+snapshot_key = SHA256("3" + namespace + kind + identity + prefix_key)
 ```
 
 文件格式：
@@ -121,7 +145,7 @@ local-llm-prefix-<hash>.bin
 
 - `session` 的 identity 是 Pi/Zed 的 session ID；
 - `prefix` 的 identity 是固定字符串 `prefix`，所以同一个项目的不同 session 可以共享 prefix 文件；
-- 版本号 `2` 用来让旧格式缓存整体失效。
+- 版本号 `3` 和 deployment namespace 用来让旧格式或不兼容部署的缓存整体失效。
 
 用户消息、assistant 历史和 tool result 不参与 prefix key。这是有意设计：它们属于会话动态尾部，应该由 llama.cpp 的 common-prefix cache 处理。
 
@@ -131,11 +155,10 @@ local-llm-prefix-<hash>.bin
 
 代理识别 session affinity：
 
-1. `X-Session-Affinity`
-2. `X-Pi-Session-Id`
-3. `X-Client-Request-Id`
-4. 请求体中的 `session_id` 或 `prompt_cache_key`
-5. 没有显式 ID 时，使用 `anonymous-<prefix_key>`
+1. `X-Session-Affinity`, `X-Session-Id`, `X-Conversation-Id`
+2. `X-Pi-Session-Id`, `X-OpenCode-Session`, `X-Client-Request-Id`
+3. 请求体中的 `session_id`, `conversation_id` 或 `prompt_cache_key`
+4. 没有显式 ID 时，默认使用 `anonymous-<prefix_key>`；`PI_LLAMA_CACHE_REQUIRE_SESSION_ID=true` 时拒绝请求
 
 图片和其他非文本多模态请求不做磁盘快照，只转发请求。`cache_prompt` 使用 llama-server 的服务级默认值（当前默认开启），proxy 不再给每个请求重复添加这个字段。
 
@@ -163,13 +186,15 @@ local-llm-prefix-<hash>.bin
 
 ### 3. 保存 session
 
-成功响应返回后，代理通过 llama.cpp 的 slot save API 保存：
+默认情况下，成功响应返回后，代理通过 llama.cpp 的 slot save API 保存：
 
 ```text
 当前 slot -> local-llm-session-<hash>.bin
 ```
 
 同时更新内存中的 session slot 映射。
+
+使用 `PI_LLAMA_CACHE_SAVE_POLICY=terminal` 时，`finish_reason=tool_calls` 不立即写盘。状态保持为 dirty hot slot；同一 session 的下一次工具回合直接复用它。代理会在最终响应、另一个 session 可能覆盖 slot 之前、或干净关闭时保存。
 
 ### 4. 后台生成纯 prefix
 
