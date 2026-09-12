@@ -25,7 +25,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from cache_core import build_prefix_payload, cache_filename, cache_key, with_slot_cache
+from cache_core import (
+    PrefixManifest,
+    best_prefix_manifest,
+    build_prefix_payload,
+    cache_filename,
+    cache_key,
+    manifest_filename,
+    normalize_tokens,
+    with_slot_cache,
+)
 
 
 LOGGER = logging.getLogger("local-llm-kv-cache")
@@ -233,6 +242,8 @@ class LlamaCacheProxy:
         prefix_seed_delay_seconds: float = 2.0,
         save_policy: str = "all",
         require_session_id: bool = False,
+        shared_prefix_scope: str | None = None,
+        minimum_shared_prefix_tokens: int = 128,
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme != "http" or not parsed.hostname:
@@ -251,6 +262,21 @@ class LlamaCacheProxy:
             raise ValueError("save_policy must be 'all' or 'terminal'")
         self.save_policy = save_policy
         self.require_session_id = require_session_id
+        self.cache_namespace = os.environ.get("PI_LLAMA_CACHE_NAMESPACE", "default").strip() or "default"
+        self.shared_prefix_scope = (
+            shared_prefix_scope
+            if shared_prefix_scope is not None
+            else os.environ.get("PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE", "default")
+        ).strip()
+        if not self.shared_prefix_scope:
+            raise ValueError("shared_prefix_scope must not be empty")
+        if (
+            isinstance(minimum_shared_prefix_tokens, bool)
+            or not isinstance(minimum_shared_prefix_tokens, int)
+            or minimum_shared_prefix_tokens < 1
+        ):
+            raise ValueError("minimum_shared_prefix_tokens must be a positive integer")
+        self.minimum_shared_prefix_tokens = minimum_shared_prefix_tokens
         self.operation_lock = threading.Lock()
         self.session_states: dict[str, SlotState] = {}
         self.prefix_seed_lock = threading.Lock()
@@ -269,6 +295,8 @@ class LlamaCacheProxy:
         restored_source = None
         candidate_slot_id = None
         slot_task_ids: dict[int, int] = {}
+        shared_prefix_restored = False
+        rejected_shared_source: Path | None = None
         if hot_state is not None:
             slot_id = hot_state.slot_id
             self._touch_snapshot(session_file)
@@ -279,18 +307,65 @@ class LlamaCacheProxy:
             # owner before allowing llama.cpp to overwrite one.
             self._flush_dirty_states("before_eviction")
             candidate_slot_id = self._wait_for_idle_slot()
-            sources = tuple(path for path in (session_file, prefix_file) if path.exists())
-            if sources:
+            if session_file.exists():
                 self._forget_slot(candidate_slot_id)
                 restored_source = self._restore_first_available(
-                    candidate_slot_id, sources, session_ref=session_ref
+                    candidate_slot_id, (session_file,), session_ref=session_ref
+                )
+            if restored_source is None:
+                try:
+                    request_tokens = self._render_tokens(body)
+                    shared = self._best_shared_prefix(request_tokens)
+                except (RuntimeError, TimeoutError, OSError, TypeError, ValueError) as error:
+                    shared = None
+                    _log_event(
+                        "shared_prefix_discovery_failed",
+                        level=logging.WARNING,
+                        session_ref=session_ref,
+                        error_type=type(error).__name__,
+                    )
+                if shared is not None:
+                    shared_source, candidate_tokens, verified_lcp = shared
+                    self._forget_slot(candidate_slot_id)
+                    restored_source = self._restore_first_available(
+                        candidate_slot_id,
+                        (shared_source,),
+                        session_ref=session_ref,
+                        expected_tokens=candidate_tokens,
+                        remove_on_count_mismatch=True,
+                    )
+                    if restored_source is not None:
+                        shared_prefix_restored = True
+                        _log_event(
+                            "shared_prefix_restore",
+                            session_ref=session_ref,
+                            slot_id=candidate_slot_id,
+                            candidate_tokens=candidate_tokens,
+                            verified_lcp=verified_lcp,
+                        )
+                    else:
+                        rejected_shared_source = shared_source
+            if (
+                restored_source is None
+                and prefix_file.exists()
+                and prefix_file != rejected_shared_source
+            ):
+                self._forget_slot(candidate_slot_id)
+                restored_source = self._restore_first_available(
+                    candidate_slot_id, (prefix_file,), session_ref=session_ref
                 )
             if restored_source is None:
                 _log_event("cache_miss", session_ref=session_ref, slot_id=candidate_slot_id)
             else:
                 _log_event(
                     "cache_hit",
-                    layer="session" if restored_source == session_file else "prefix",
+                    layer=(
+                        "session"
+                        if restored_source == session_file
+                        else "prefix"
+                        if restored_source == prefix_file
+                        else "shared_prefix"
+                    ),
                     session_ref=session_ref,
                     slot_id=candidate_slot_id,
                 )
@@ -304,11 +379,52 @@ class LlamaCacheProxy:
             session_file=session_file,
             prefix_file=prefix_file,
             prefix_payload=prefix_payload,
-            prefix_was_present=prefix_file.exists() and (restored_source is not None or hot_state is not None),
+            # Legacy exact-prefix snapshots deliberately remain "not present":
+            # completion then schedules migration to a token-proven manifest.
+            prefix_was_present=shared_prefix_restored,
             candidate_slot_id=candidate_slot_id,
             slot_task_ids=slot_task_ids,
         )
         return with_slot_cache(body, slot_id), plan
+
+    def _render_tokens(self, body: dict[str, Any]) -> tuple[int, ...]:
+        rendered = self._json_request("POST", "/apply-template", copy.deepcopy(body))
+        prompt = rendered.get("prompt") if isinstance(rendered, dict) else None
+        if not isinstance(prompt, str) or not prompt:
+            raise ValueError("apply-template returned no prompt")
+        tokenized = self._json_request(
+            "POST",
+            "/tokenize",
+            {"content": prompt, "add_special": False, "parse_special": True},
+        )
+        if not isinstance(tokenized, dict):
+            raise TypeError("tokenize returned an invalid response")
+        return normalize_tokens(tokenized.get("tokens"))
+
+    def _best_shared_prefix(self, request_tokens: tuple[int, ...]) -> tuple[Path, int, int] | None:
+        manifests: list[PrefixManifest] = []
+        for path in self.cache_dir.glob("local-llm-prefix-*.bin.manifest.json"):
+            try:
+                if path.stat().st_size > MAX_METADATA_BYTES:
+                    continue
+                manifest = PrefixManifest.from_json(path.read_bytes())
+                snapshot = self.cache_dir / manifest.snapshot
+                if path.name != f"{manifest.snapshot}.manifest.json" or not snapshot.is_file():
+                    continue
+                manifests.append(manifest)
+            except (OSError, ValueError):
+                continue
+        selected = best_prefix_manifest(
+            manifests,
+            request_tokens,
+            self.cache_namespace,
+            self.shared_prefix_scope,
+            self.minimum_shared_prefix_tokens,
+        )
+        if selected is None:
+            return None
+        manifest, lcp = selected
+        return self.cache_dir / manifest.snapshot, len(manifest.tokens), lcp
 
     @staticmethod
     def _touch_snapshot(source: Path) -> int | None:
@@ -338,6 +454,8 @@ class LlamaCacheProxy:
         slot_id: int,
         sources: tuple[Path, ...],
         session_ref: str | None = None,
+        expected_tokens: int | None = None,
+        remove_on_count_mismatch: bool = False,
     ) -> Path | None:
         for source in sources:
             if not source.exists():
@@ -354,6 +472,31 @@ class LlamaCacheProxy:
                     slot_id=slot_id,
                     error_type=type(error).__name__,
                 )
+                continue
+            if expected_tokens is not None and n_restored != expected_tokens:
+                _log_event(
+                    "snapshot_restore_token_count_mismatch",
+                    level=logging.ERROR,
+                    session_ref=session_ref,
+                    filename=source.name,
+                    slot_id=slot_id,
+                    expected_tokens=expected_tokens,
+                    restored_tokens=n_restored,
+                )
+                if remove_on_count_mismatch:
+                    for stale_path in (
+                        source,
+                        self.cache_dir / manifest_filename(source.name),
+                    ):
+                        try:
+                            stale_path.unlink(missing_ok=True)
+                        except OSError as exc:
+                            _log_event(
+                                "snapshot_pair_cleanup_failed",
+                                level=logging.WARNING,
+                                filename=stale_path.name,
+                                error_type=type(exc).__name__,
+                            )
                 continue
             snapshot_bytes = self._touch_snapshot(source)
             _log_event(
@@ -529,20 +672,135 @@ class LlamaCacheProxy:
                 LOGGER.info("prefix seed skipped while proxy is busy: %s", prefix_file.name)
                 return
             try:
-                idle_slots = [
+                idle_slots = self._idle_slots()
+                owned_slot_ids = {state.slot_id for state in self.session_states.values()}
+                spare_slots = [
                     slot
-                    for slot in self._idle_slots({excluded_slot_id})
-                    if int(slot.get("id", -1)) not in {state.slot_id for state in self.session_states.values()}
+                    for slot in idle_slots
+                    if int(slot.get("id", -1)) != excluded_slot_id
+                    and int(slot.get("id", -1)) not in owned_slot_ids
                 ]
-                if not idle_slots:
-                    LOGGER.info("prefix seed skipped: no safe idle slot: %s", prefix_file.name)
-                    return
-                slot_id = min(idle_slots, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
+                owner: tuple[str, SlotState] | None = None
+                if spare_slots:
+                    slot_id = int(
+                        min(spare_slots, key=lambda slot: int(slot.get("n_prompt_tokens") or 0)).get("id", 0)
+                    )
+                else:
+                    owner = next(
+                        (
+                            (session_id, state)
+                            for session_id, state in self.session_states.items()
+                            if state.slot_id == excluded_slot_id
+                        ),
+                        None,
+                    )
+                    owner_slot = next(
+                        (slot for slot in idle_slots if int(slot.get("id", -1)) == excluded_slot_id),
+                        None,
+                    )
+                    if (
+                        owner is None
+                        or owner_slot is None
+                        or owner[1].dirty
+                        or owner[1].session_file is None
+                        or not owner[1].session_file.is_file()
+                        or int(owner_slot.get("n_prompt_tokens") or 0) != owner[1].n_tokens
+                    ):
+                        LOGGER.info("prefix seed skipped: no safe idle slot: %s", prefix_file.name)
+                        return
+                    slot_id = excluded_slot_id
+
                 request = self._prefix_seed_payload(prefix_payload)
-                request["id_slot"] = int(slot_id)
-                self._json_request("POST", "/v1/chat/completions", request)
-                self._save(int(slot_id), prefix_file)
-                self._forget_slot(int(slot_id))
+                tokens = self._render_tokens(request)
+                if self._has_foreground_waiters():
+                    LOGGER.info("prefix seed skipped after discovery: foreground request is waiting: %s", prefix_file.name)
+                    return
+                slot_changed = False
+                owner_guard: Path | None = None
+                try:
+                    if owner is not None:
+                        owner_guard = owner[1].session_file.with_suffix(
+                            owner[1].session_file.suffix + ".seed-owner.tmp"
+                        )
+                        owner_saved = self._save(
+                            slot_id,
+                            owner_guard,
+                            reason="before_prefix_seed",
+                            session_ref=_session_ref(owner[0]),
+                        )
+                        if owner_saved != owner[1].n_tokens:
+                            _log_event(
+                                "prefix_seed_owner_save_failed",
+                                level=logging.ERROR,
+                                slot_id=slot_id,
+                                session_ref=_session_ref(owner[0]),
+                                expected_tokens=owner[1].n_tokens,
+                                saved_tokens=owner_saved,
+                            )
+                            return
+                    seed_request = {
+                        "prompt": list(tokens),
+                        "cache_prompt": False,
+                        "n_predict": 0,
+                        "stream": False,
+                        "id_slot": slot_id,
+                    }
+                    slot_changed = True
+                    self._json_request("POST", "/completion", seed_request)
+                    seed_file = self._prefix_seed_target(prefix_file)
+                    manifest_path = self.cache_dir / manifest_filename(seed_file.name)
+                    n_saved = self._save(slot_id, seed_file)
+                    if n_saved != len(tokens):
+                        seed_file.unlink(missing_ok=True)
+                        manifest_path.unlink(missing_ok=True)
+                        _log_event(
+                            "prefix_seed_token_count_mismatch",
+                            level=logging.ERROR,
+                            filename=seed_file.name,
+                            slot_id=slot_id,
+                            expected_tokens=len(tokens),
+                            saved_tokens=n_saved,
+                        )
+                        return
+                    try:
+                        self._write_manifest(seed_file, tokens)
+                    except Exception:
+                        seed_file.unlink(missing_ok=True)
+                        manifest_path.unlink(missing_ok=True)
+                        raise
+                    if owner is None:
+                        self._forget_slot(slot_id)
+                finally:
+                    if owner is not None and slot_changed:
+                        try:
+                            # slot_changed is set only after the owner guard was
+                            # created and its saved token count was validated.
+                            n_restored = self._restore(slot_id, owner_guard)
+                        except (RuntimeError, TimeoutError, OSError, TypeError, ValueError):
+                            self._forget_slot(slot_id)
+                            _log_event(
+                                "prefix_seed_owner_restore_failed",
+                                level=logging.ERROR,
+                                slot_id=slot_id,
+                                session_ref=_session_ref(owner[0]),
+                            )
+                        else:
+                            if n_restored != owner[1].n_tokens:
+                                self._forget_slot(slot_id)
+                                _log_event(
+                                    "prefix_seed_owner_restore_failed",
+                                    level=logging.ERROR,
+                                    slot_id=slot_id,
+                                    session_ref=_session_ref(owner[0]),
+                                    expected_tokens=owner[1].n_tokens,
+                                    restored_tokens=n_restored,
+                                )
+                            else:
+                                self.session_states[owner[0]] = replace(
+                                    owner[1], dirty=False
+                                )
+                    if owner_guard is not None:
+                        owner_guard.unlink(missing_ok=True)
                 self._prune()
                 LOGGER.info("seeded stable prefix -> %s", prefix_file.name)
             finally:
@@ -552,6 +810,43 @@ class LlamaCacheProxy:
         finally:
             with self.prefix_seed_lock:
                 self.prefix_seeds_in_flight.discard(prefix_file)
+
+    def _prefix_seed_target(self, prefix_file: Path) -> Path:
+        """Keep a published pair immutable while a replacement pair is built."""
+        manifest_path = self.cache_dir / manifest_filename(prefix_file.name)
+        try:
+            manifest = PrefixManifest.from_json(manifest_path.read_bytes())
+            valid_pair = prefix_file.is_file() and manifest.snapshot == prefix_file.name
+        except (OSError, ValueError):
+            valid_pair = False
+        if not valid_pair:
+            return prefix_file
+        generation = os.urandom(8).hex()
+        return prefix_file.with_name(f"{prefix_file.stem}-{generation}{prefix_file.suffix}")
+
+    def _write_manifest(self, snapshot: Path, tokens: tuple[int, ...]) -> Path:
+        if not snapshot.is_file():
+            raise RuntimeError("cannot publish a manifest without its snapshot")
+        manifest = PrefixManifest(
+            self.cache_namespace,
+            self.shared_prefix_scope,
+            snapshot.name,
+            tokens,
+        )
+        target = self.cache_dir / manifest_filename(snapshot.name)
+        temporary = target.with_suffix(target.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                stream.write(manifest.to_json())
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary.replace(target)
+            target.chmod(0o600)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return target
 
     def _has_foreground_waiters(self) -> bool:
         with self.foreground_waiters_lock:
@@ -697,7 +992,7 @@ class LlamaCacheProxy:
             response = connection.getresponse()
             raw = response.read()
             if response.status < 200 or response.status >= 300:
-                raise RuntimeError(f"llama {method} {path} returned {response.status}: {raw[:240]!r}")
+                raise RuntimeError(f"llama {method} {path} returned {response.status}")
             return json.loads(raw or b"{}")
         finally:
             connection.close()
@@ -756,6 +1051,7 @@ class LlamaCacheProxy:
             if int(result.get("n_saved") or 0) <= 0 or not temporary.exists():
                 raise RuntimeError(f"llama saved no tokens for slot {slot_id}")
             temporary.replace(target)
+            target.chmod(0o600)
         finally:
             try:
                 temporary.unlink(missing_ok=True)
@@ -780,6 +1076,12 @@ class LlamaCacheProxy:
         return n_saved
 
     def _prune(self) -> None:
+        for manifest in self.cache_dir.glob("local-llm-prefix-*.bin.manifest.json"):
+            snapshot = self.cache_dir / manifest.name.removesuffix(".manifest.json")
+            if not snapshot.is_file():
+                manifest.unlink(missing_ok=True)
+        for temporary in self.cache_dir.glob("local-llm-*.tmp"):
+            temporary.unlink(missing_ok=True)
         files = sorted(
             self.cache_dir.glob("local-llm-*.bin"),
             key=lambda path: path.stat().st_mtime,
@@ -789,6 +1091,8 @@ class LlamaCacheProxy:
             victim = files.pop(0)
             size = victim.stat().st_size
             victim.unlink(missing_ok=True)
+            if victim.name.startswith("local-llm-prefix-"):
+                (self.cache_dir / manifest_filename(victim.name)).unlink(missing_ok=True)
             total -= size
             _log_event(
                 "snapshot_prune",
@@ -996,6 +1300,10 @@ def main() -> None:
         prefix_seed_delay_seconds=float(os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_DELAY", "2")),
         save_policy=os.environ.get("PI_LLAMA_CACHE_SAVE_POLICY", "all").strip().lower(),
         require_session_id=_env_bool("PI_LLAMA_CACHE_REQUIRE_SESSION_ID", False),
+        shared_prefix_scope=os.environ.get("PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE"),
+        minimum_shared_prefix_tokens=int(
+            os.environ.get("PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS", "128")
+        ),
     )
     ProxyHandler.proxy = proxy
     host = os.environ.get("PI_LLAMA_CACHE_HOST", "127.0.0.1")

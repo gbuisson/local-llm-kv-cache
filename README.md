@@ -3,7 +3,7 @@
 这套方案为本机的 Pi、Zed 编程 agent 增加两级缓存：
 
 1. 同一会话的内存热缓存，继续对话时直接复用 llama.cpp slot。
-2. 项目稳定前缀的磁盘冷缓存，代理或 llama 重启后，新会话可以恢复 system prompt 和工具 schema 的 KV 状态。
+2. 项目稳定前缀的磁盘冷缓存，包括可跨新会话复用的 golden shared prefix。代理或 llama 重启后，新会话可以恢复 system prompt、工具 schema 等仍然完全相同的 token 前缀。
 
 当前入口是 `127.0.0.1:18082`，上游是 `127.0.0.1:8080`。prompt cache 的实际计算和 checkpoint restore 都由 llama.cpp 完成，proxy 不伪造命中。
 
@@ -32,7 +32,10 @@ curl -fsS http://127.0.0.1:18082/health
 | Variable | Default | Purpose |
 |---|---:|---|
 | `PI_LLAMA_CACHE_NAMESPACE` | `default` | Invalidates snapshots across model, llama.cpp, context, or template deployments. Use a stable deployment fingerprint. |
-| `PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING` | `true` | Allows best-effort prefix seeding. Disable it for a one-slot (`-np 1`) server. |
+| `PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING` | `true` | Allows best-effort golden-prefix seeding. `-np 1` 也受支持，见下文的事务式 slot swap。 |
+| `PI_LLAMA_CACHE_PREFIX_SEED_DELAY` | `2` | 成功响应后，后台 seed 开始前的秒数；有前台等待者时 seed 会跳过。 |
+| `PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE` | `default` | Shared-prefix 隔离域。个人与工作环境必须使用不同的显式值，例如 `personal` 与 `work`。 |
+| `PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS` | `128` | 接受 golden 候选所需的最小 exact LCP token 数；必须为正整数。 |
 | `PI_LLAMA_CACHE_SAVE_POLICY` | `all` | `all` saves every successful response. `terminal` defers `finish_reason=tool_calls`, then saves on a terminal response, before eviction, or during clean shutdown. |
 | `PI_LLAMA_CACHE_REQUIRE_SESSION_ID` | `false` | Rejects anonymous cache-managed text chat requests. Media chat requests remain allowed without affinity because they run serialized and unmanaged after flushing dirty state. Recommended when conversation isolation is required. |
 | `PI_LLAMA_CACHE_MAX_GIB` | `12` | LRU disk budget for snapshot files. Successful restores and hot reuse refresh recency. |
@@ -54,7 +57,7 @@ The public route contract is explicit and fail-closed:
 
 For clients that consistently prefix llama.cpp utility routes with `/v1`, the proxy maps `GET`/`HEAD /v1/props` to `/props` and maps `POST /v1/tokenize`, `/v1/detokenize`, and `/v1/apply-template` to their native unprefixed endpoints. `HEAD` suppresses the upstream response body, while `OPTIONS` and its CORS preflight request headers pass through unchanged.
 
-Operational events are emitted as compact JSON. Session identifiers and prompts are never logged; `session_ref` is a truncated SHA-256 reference suitable for correlation.
+Operational events are emitted as compact JSON. Session identifiers、rendered prompt、token ID 数组和 manifest 内容都不会写入日志；`session_ref` 是可用于关联的截断 SHA-256。Shared-prefix 事件只记录候选 token 数和验证后的 LCP 长度等计数。
 
 ### Context compaction
 
@@ -85,6 +88,7 @@ Pi / pi-acp / Zed
           |
           +-- 内存 session slot 映射
           +-- ~/.llama-slot-cache/*.bin
+          +-- 私有 *.bin.manifest.json（scope + exact token IDs）
           |
           v
 127.0.0.1:8080  llama.cpp llama-server
@@ -97,7 +101,7 @@ Pi / pi-acp / Zed
 同一个 session 的 slot 状态是代理的内存 affinity 记录。请求不会为了复用另一个 session 的稳定 prefix 而抢占其完整上下文；没有可用的 hot session 时，代理优先选择没有 session 所有权的空闲 slot，再按以下顺序恢复：
 
 ```text
-hot session → session snapshot → prefix snapshot → full prefill
+hot session → session snapshot → shared golden prefix → legacy exact prefix → cold/full prefill
 ```
 
 这样多个 Pi、Zed session 交替使用时，失去内存 slot 的 session 仍能从自己的完整快照恢复，不会把另一个 session 的动态历史当成自己的缓存。
@@ -162,6 +166,35 @@ local-llm-prefix-<hash>.bin
 
 用户消息、assistant 历史和 tool result 不参与 prefix key。这是有意设计：它们属于会话动态尾部，应该由 llama.cpp 的 common-prefix cache 处理。
 
+### Golden shared prefix：以实际 token 为准
+
+`prefix_key` 仍用于 session snapshot 和旧版 exact-prefix fallback；跨不同 bootstrap 的 golden 复用不把 canonical JSON hash 当作“足够相似”的证明。对于没有 hot/session snapshot 的文本请求，代理使用当前 llama.cpp 实例的原生 API 按固定顺序计算实际输入：
+
+1. `POST /apply-template`，请求体是将要发送的 chat-completion body；
+2. 取返回的完整 rendered prompt，再 `POST /tokenize`，参数为 `add_special=false`、`parse_special=true`；
+3. 用返回的整数 token ID 序列与磁盘 manifest 比较。
+
+每个 golden snapshot 有一个同名 companion manifest：
+
+```text
+local-llm-prefix-<hash>.bin
+local-llm-prefix-<hash>.bin.manifest.json
+```
+
+manifest 包含 schema version、`PI_LLAMA_CACHE_NAMESPACE`、`PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE`、snapshot basename 和完整 token ID 数组。只考虑 namespace 与 shared scope 都完全相同、manifest 合法且对应 `.bin` 确实存在的候选；其中选择与当前请求 **最长 exact common prefix (LCP)** 最大且达到 `PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS` 的一个。比较逐 token 严格相等，不使用 hash 相似度、百分比或文本启发式。
+
+restore 后代理把该 slot 固定给当前请求，让 llama.cpp 自己执行 native LCP。第一处 token 分歧后的旧 KV/GDN 状态全部被拒绝或截断，只重新使用分歧之前的状态。因此 skills、tools、system/developer prompt、memory、日期、chat template 或 reasoning/thinking mode 的变化只会让 LCP 变短（可能低于阈值而 cold），不会产生跨越分歧点的 stale hit。例如日期位于较晚位置时仍可复用它之前的 token；早期 system prompt 改动则可能几乎完全 cold。
+
+`PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE` 是显式数据与信任边界，不是性能标签。同一机器上的个人和工作 Hermes 必须分别配置，例如：
+
+```ini
+Environment=PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE=personal
+# 工作实例使用另一个 unit/cache namespace：
+Environment=PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE=work
+```
+
+不要让 personal/work 实例共享同一个 scope。部署模型、GGUF、llama.cpp、context 或 template 发生不兼容变化时，还必须轮换 `PI_LLAMA_CACHE_NAMESPACE`。
+
 ## 请求生命周期
 
 ### 1. 收到请求
@@ -173,7 +206,7 @@ local-llm-prefix-<hash>.bin
 3. 请求体中的 `session_id`, `conversation_id` 或 `prompt_cache_key`
 4. 没有显式 ID 时，默认使用 `anonymous-<prefix_key>`；`PI_LLAMA_CACHE_REQUIRE_SESSION_ID=true` 时拒绝请求
 
-图片和其他非文本多模态请求不做磁盘快照，只转发请求。`cache_prompt` 使用 llama-server 的服务级默认值（当前默认开启），proxy 不再给每个请求重复添加这个字段。
+图片和其他非文本多模态请求不做磁盘快照，只转发请求。成功命中的 hot/session/shared/legacy slot 只由 proxy 固定 `id_slot`；`cache_prompt` 保留客户端或 llama-server 的默认行为。当前生产 llama-server 默认启用 prompt cache；客户端显式关闭时会失去 LCP 性能收益，但不会越过 token 分歧产生 stale hit。
 
 ### 2. 查找缓存
 
@@ -184,10 +217,11 @@ local-llm-prefix-<hash>.bin
 | 同 session 热缓存 | session ID、prefix key 相同，slot idle，token 数一致 | 直接复用内存 slot，不读盘 |
 | 空闲 slot | hot session 不可用 | 优先选择没有 session 所有权的 slot，避免驱逐其他活跃会话 |
 | 磁盘 session 快照 | `local-llm-session-*.bin` 存在且 restore 成功 | 恢复具体会话 |
-| 磁盘 prefix 快照 | `local-llm-prefix-*.bin` 存在且 restore 成功 | 恢复项目稳定前缀 |
-| 缓存未命中 | 上述条件都不满足 | 完整 prefill |
+| Golden shared prefix | 同 namespace+scope 的合法 manifest 中 exact LCP 最长且达到最小阈值，snapshot restore 成功 | 恢复候选并由 llama.cpp 在第一处分歧处截断 |
+| Legacy exact prefix | 当前 `prefix_key` 的 `local-llm-prefix-*.bin` 存在且 restore 成功 | 兼容旧缓存格式的 exact fallback |
+| 缓存未命中 | 上述条件都不满足 | cold/full prefill |
 
-只有 hot session 请求会被加上 slot affinity；冷请求不指定 slot，让 llama.cpp 做 native LCP 选择：
+命中 hot session 或成功 restore session/shared/legacy snapshot 时，请求会固定到已准备的 slot：
 
 ```json
 {
@@ -195,7 +229,7 @@ local-llm-prefix-<hash>.bin
 }
 ```
 
-冷请求不会添加 `id_slot`。`cache_prompt` 由 llama-server 的默认配置控制；如果客户端显式传入 `cache_prompt=false`，则会按客户端要求关闭缓存。
+真正的 cold 请求不会添加 `id_slot`。proxy 不覆盖 `cache_prompt`；shared 性能复用依赖客户端或 llama-server 启用 native prompt cache。关闭它只会使当前完整 prompt 重新 prefill。`/apply-template`、`/tokenize` 失败或返回 malformed 数据，以及 malformed/orphan manifest、低于最小 LCP、scope/namespace 不匹配、shared restore 失败，都不会形成 shared hit：仅在 independently valid 的 legacy exact snapshot 存在时继续该 fallback，否则 cold；不会猜测 token，也不会把发现错误升级为用户请求失败。
 
 ### 3. 保存 session
 
@@ -211,19 +245,20 @@ local-llm-prefix-<hash>.bin
 
 ### 4. 后台生成纯 prefix
 
-如果项目还没有纯 prefix 文件，代理可以在安全的空闲 slot 中发送一个内部请求：
+如果项目还没有纯 prefix 文件，代理先对纯 system/developer/tools body 做一次 `/apply-template` + `/tokenize`，然后在安全的空闲 slot 中用 `/completion` 直接提交这组 exact token IDs：
 
 ```json
 {
-  "messages": "只保留 system/developer/tools",
-  "add_generation_prompt": false,
+  "prompt": [151644, 8948, 198],
   "cache_prompt": false,
   "n_predict": 0,
   "stream": false
 }
 ```
 
-这个请求的 slot 会被保存为 `local-llm-prefix-<hash>.bin`。它不会抢占活跃 session 的 slot；没有安全的空闲 slot、代理忙或有前台请求排队时，会立即跳过。这是可丢弃的 best-effort 优化，不参与 session 正确性。
+这个请求的 slot 会被原子保存为 `local-llm-prefix-<hash>.bin`。token identity 的证明来自 `/completion` 收到的 exact token array；`n_saved == len(tokens)` 是额外的完整性检查，而不是单独的 identity 证明。两者都成立后，proxy 才原子发布 mode `0600` 的 companion manifest。shared restore 也要求 `n_restored == len(manifest.tokens)`；计数不一致会删除该 shared pair 并回退。缓存目录本身为 `0700`。有 spare unowned idle slot 时直接使用它。`-np 1` 没有 spare slot 时也可以安全 seed，但仅限唯一 owner 已 idle、clean、slot token 数一致，而且该 owner 的完整 session snapshot 已经落盘：代理在持有完整 operation lock 的情况下先把 owner 保存到独立 guard snapshot 并验证 token 数，执行 seed，依次原子保存 snapshot 和 manifest，再在 `finally` 中从 guard 恢复并验证 owner token 数后才释放锁。owner restore 失败或 token 数不符时只忘记 hot ownership，原始持久化 session snapshot 保留供下一次请求恢复。
+
+dirty owner、缺失 session snapshot、slot/guard/seed/restore token 数不一致、前台请求正在等待、代理忙或任何 API/save/manifest 错误都会跳过或回滚为无 shared golden snapshot。损坏 pair 的物理删除是 best-effort；read-only/I/O 清理失败只记录结构化事件。已经被 shared 校验拒绝的文件在同一次请求内不会再被 legacy exact fallback 重试，因此清理失败仍继续 cold。legacy exact prefix 可以作为其他文件的兼容 fallback，但不会抑制 golden migration seed。prune 同时删除 orphan manifests 和临时 metadata。成功恢复任意兼容 shared golden 后不会为该次请求再 seed 一个仅日期不同的新 exact snapshot，避免磁盘中产生大量近重复文件。seed 是可丢弃的 best-effort 优化，不参与 session 正确性；第一个 session 仍需支付正常 prefill，以及后台 seed 的一次额外 prefill/save 成本。
 
 纯 prefix 快照很重要。Qwen3.8 是混合 GDN 架构，不能可靠地把“包含旧 user/assistant 历史的完整快照”直接当作所有新 session 的 prefix。纯 prefix 恢复后，llama.cpp 才能把新用户消息作为 suffix 继续计算。
 
@@ -249,7 +284,7 @@ KV(prefix) + 当前 slot 状态
 
 ## 什么时候会失效
 
-以下变化会生成新的 prefix key：
+以下变化会生成新的 legacy prefix key，并在 golden 路径中于实际 rendered token 的第一处分歧处缩短 LCP：
 
 - system/developer prompt 文本、顺序、空格或换行变化；
 - tools 或工具 JSON schema 变化；
@@ -257,6 +292,9 @@ KV(prefix) + 当前 slot 状态
 - thinking 或 chat template 参数变化；
 - response format、grammar、JSON schema 变化；
 - `add_generation_prompt`、`continue_final_message` 等模板行为变化。
+- Hermes skills、system/developer 指令或 memory 内容变化；
+- 注入日期或其他易变 bootstrap 内容变化；
+- llama.cpp chat template 实际输出或 reasoning/thinking mode 变化。
 
 以下情况也会导致磁盘缓存未命中：
 
@@ -267,7 +305,7 @@ KV(prefix) + 当前 slot 状态
 - 多模态请求；
 - 缓存版本变化。
 
-restore 失败不会让请求失败。代理会记录 warning，继续使用当前 slot 完整 prefill；成功后可以重新生成 prefix 快照。
+render/tokenize API 失败、响应 malformed、manifest malformed、manifest 指向不存在的 snapshot（orphan）、seed 的 `n_saved` 计数不一致或 restore 失败都不会让请求失败。代理记录不含 prompt/token 内容的 warning，并 cold/full prefill；成功后可以重新生成 prefix 快照。严格 token LCP 保证配置变化只造成较短命中或 cold，不会造成 stale reuse。
 
 ### 模型更换注意事项
 
@@ -281,16 +319,17 @@ restore 失败不会让请求失败。代理会记录 warning，继续使用当�
 - 完整重启 llama 后再 restore 12,700-token snapshot：`n_restored=12700`，下一条 divergent prompt 为 `cache_n=12662`、`prompt_n=38`、`0.356s`；
 - 真实 proxy 链路中，session 被另一会话挤出后 restore 仍返回 `cached_tokens=12743/12793`；
 - 未修复的 llama.cpp 在相同 restore 场景中会返回 `n_restored`，但 `cache_n=0`，因此不能只看 restore 日志判断命中。
+- 一套 Dirk Qwen3.8 Q6_K、128K、KV q4_0、checkpointed 测试部署在 2026-09-12 的真实 Hermes cold baseline 为 `25,960` prompt tokens、`cached_tokens=0`、`233.94s` prompt eval、`110.97 tok/s`；对应 session snapshot 为 `824,255,044` bytes（`786.07 MiB`）。Golden-prefix B 结果见本次发布的 benchmark 记录。
 
 对于更大的编程 agent prompt，收益主要来自跳过稳定 system prompt、项目规则和工具 schema 的 prefill。能节省多少时间取决于实际 token 数和当前 prompt processing throughput，但跳过的 token 数会直接体现在 `cached_tokens` / `timings.cache_n` 中。
 
 ## 成本和边界
 
 - 这是 prompt prefill 优化，不会减少模型权重显存，也不会提高模型 decode 本身的 tokens/s；
-- slot snapshot 文件较大，当前验证文件约为每个 150–240 MB，12 GiB 上限约束了可保留的快照数量；
-- prefix seed 是可丢弃的 best-effort 优化；没有安全空闲 slot 时立即跳过，不阻塞前台请求；
+- slot snapshot 大小强烈依赖模型、context 和 recurrent checkpoints：旧验证约 150–240 MB，而当前 Dirk 128K checkpointed 实测 session snapshot 为 786.07 MiB；12 GiB 在该尺寸下最多容纳 15 个完整 snapshot，实际还要给不同长度和 manifest 留余量；
+- prefix seed 是可丢弃的 best-effort 优化；首次建立 golden snapshot 有一次 seed prefill/save 成本，有前台等待者或没有可安全交换的 slot 时立即跳过；
 - 缓存请求通过全局 operation lock 串行化，优先保证 slot snapshot 不互相覆盖；高并发客户端会排队等待空闲 slot；
-- 缓存文件包含本地 prompt/KV 状态，只应保留在本机 loopback 和用户目录，不应把 18082 暴露出去。
+- snapshot 和 manifest 都是私有数据。manifest 的 token ID 可以用同一 tokenizer 逆向 detokenize，不能视为 hash 或匿名化数据；它继承 snapshot 的敏感级别。只应保留在 mode `0700` 的本机用户目录、以 `0600` 文件存储，不应同步/上传，也不应把 18082 暴露出去。
 
 ## 运行和排查
 
@@ -312,10 +351,55 @@ curl -fsS http://127.0.0.1:18082/v1/models
 确认真正命中：
 
 ```text
-代理日志：reusing hot session / restored local-llm-session-... / restored local-llm-prefix-...
+代理日志：cache_hit(layer=hot/session/shared_prefix/prefix)、shared_prefix_restore(candidate_tokens, verified_lcp)
 API 响应：usage.prompt_tokens_details.cached_tokens > 0
 API timings：timings.cache_n > 0
 ```
+
+`shared_prefix_restore` 中的 `verified_lcp` 是代理在 manifest 与当前实际 token 间验证的长度；最终真正复用量仍以 llama.cpp 返回的 `cached_tokens` / `timings.cache_n` 为准。诊断 manifest 时不要打印可逆的 token 数组；下面只显示隔离域、token 数和 orphan 状态：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+d = Path.home() / ".llama-slot-cache"
+for p in sorted(d.glob("*.manifest.json")):
+    try:
+        m = json.loads(p.read_text())
+        print(p.name, "namespace=", m.get("namespace"), "scope=", m.get("scope"),
+              "tokens=", len(m.get("tokens", [])), "snapshot_exists=", (d / str(m.get("snapshot"))).is_file())
+    except Exception as e:
+        print(p.name, "MALFORMED", type(e).__name__)
+PY
+journalctl --user -u local-llm-kv-cache.service --since '10 minutes ago' --no-pager \
+  | grep -E 'shared_prefix|cache_hit|cache_miss|prefix_seed'
+```
+
+只清除 golden/legacy prefix（保留 session snapshots）并让其重新 seed：
+
+```bash
+systemctl --user stop local-llm-kv-cache.service
+rm -f ~/.llama-slot-cache/local-llm-prefix-*.bin \
+      ~/.llama-slot-cache/local-llm-prefix-*.bin.manifest.json
+systemctl --user start local-llm-kv-cache.service
+```
+
+### Golden cache A/B acceptance
+
+使用真实 Hermes 请求做 A/B，不要只检查 restore API。两组都应使用相同模型、模板和 bootstrap，但使用全新的 session affinity；B 的第二个 session 应只在较晚的 skill/date/memory 或 user suffix 处做受控变化。
+
+```bash
+# A: 在声明式 service 配置中暂时设为 false，激活配置后发送一个全新 Hermes session。
+PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=false
+
+# B: 在同一声明式配置中启用独立 scope，激活后发送第一个 seed session；
+# 等待 seed 完成，再发送第二个全新 session。
+PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=true
+PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE=personal-ab-v1
+PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS=128
+```
+
+接受条件：先确认 A 的响应确实为 `cached_tokens=0`；如果 llama.cpp slot 仍有旧状态，先按部署方式重启/清空 llama.cpp 后再测。B 第一次支付 seed 成本，随后不同 session 出现 `layer=shared_prefix`、`verified_lcp` 达标，且 `cached_tokens`/`timings.cache_n` 和 TTFT 优于 A。受控变化只能把复用点停在第一处分歧之前；把早期 token 改掉应得到更短 LCP 或 cold。测试后恢复正式的 declarative personal/work scope 并重新激活配置；不要遗留 imperative service override。
 
 测试：
 

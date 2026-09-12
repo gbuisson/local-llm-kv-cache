@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import cache_proxy
-from cache_core import cache_filename, cache_key
+from cache_core import PrefixManifest, cache_filename, cache_key, manifest_filename
 from cache_proxy import (
     MAX_METADATA_BYTES,
     CompletionMetadata,
@@ -240,6 +240,198 @@ class CacheProxyTests(unittest.TestCase):
         self.server.server_close()
         self.tempdir.cleanup()
 
+    def _write_shared(self, name, tokens, namespace="default", scope="default"):
+        snapshot = Path(self.tempdir.name, name)
+        snapshot.write_bytes(b"snapshot")
+        manifest = PrefixManifest(namespace, scope, name, tuple(tokens))
+        Path(self.tempdir.name, manifest_filename(name)).write_text(manifest.to_json())
+        return snapshot
+
+    def test_prepare_renders_then_tokenizes_and_restores_longest_shared_prefix(self):
+        short = self._write_shared("local-llm-prefix-short.bin", [1, 2])
+        longest = self._write_shared("local-llm-prefix-long.bin", [1, 2, 3, 4])
+        self.proxy.minimum_shared_prefix_tokens = 2
+        calls = []
+
+        def api(_method, path, payload):
+            calls.append((path, payload))
+            if path == "/apply-template":
+                return {"prompt": "rendered-private-prompt"}
+            if path == "/tokenize":
+                return {"tokens": [1, 2, 3, 9]}
+            self.fail(path)
+
+        self.proxy._json_request = Mock(side_effect=api)
+        self.proxy._restore = Mock(return_value=4)
+
+        request, plan = self.proxy.prepare(self.body, "new-private-session")
+
+        self.assertEqual([call[0] for call in calls[:2]], ["/apply-template", "/tokenize"])
+        self.assertEqual(calls[1][1], {"content": "rendered-private-prompt", "add_special": False, "parse_special": True})
+        self.assertEqual(request["id_slot"], 0)
+        self.proxy._restore.assert_called_once_with(0, longest)
+        self.assertNotEqual(longest, short)
+        self.assertTrue(plan.prefix_was_present)
+
+    def test_shared_restore_prevents_exact_reseed_at_finish(self):
+        self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._restore = Mock(return_value=3)
+        self.proxy._save = Mock(return_value=4)
+        self.proxy._schedule_prefix_seed = Mock()
+
+        _request, plan = self.proxy.prepare(self.body, "new-session")
+        self.proxy.finish(plan, 200)
+
+        self.proxy._schedule_prefix_seed.assert_not_called()
+
+    def test_shared_restore_requires_manifest_token_count(self):
+        snapshot = self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
+        manifest = Path(self.tempdir.name, manifest_filename(snapshot.name))
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._restore = Mock(return_value=2)
+
+        request, plan = self.proxy.prepare(self.body, "new-session")
+
+        self.assertNotIn("id_slot", request)
+        self.assertFalse(plan.prefix_was_present)
+        self.assertFalse(snapshot.exists())
+        self.assertFalse(manifest.exists())
+
+    def test_shared_restore_cleanup_error_still_falls_back_cold(self):
+        self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._restore = Mock(return_value=2)
+
+        with patch.object(Path, "unlink", side_effect=PermissionError("read-only")) as unlink:
+            request, plan = self.proxy.prepare(self.body, "session-a")
+
+        self.assertNotIn("id_slot", request)
+        self.assertIsNone(plan.slot_id)
+        self.assertFalse(plan.prefix_was_present)
+        self.assertEqual(unlink.call_count, 2)
+
+    def test_rejected_exact_shared_source_is_not_retried_as_legacy(self):
+        exact_name = cache_filename("prefix", self.body, "prefix")
+        self._write_shared(exact_name, [1, 2, 3])
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._restore = Mock(return_value=2)
+
+        with patch.object(Path, "unlink", side_effect=PermissionError("read-only")):
+            request, plan = self.proxy.prepare(self.body, "session-a")
+
+        self.assertNotIn("id_slot", request)
+        self.assertIsNone(plan.slot_id)
+        self.assertFalse(plan.prefix_was_present)
+        self.proxy._restore.assert_called_once()
+
+    def test_session_restore_without_golden_still_schedules_first_seed(self):
+        session_file = Path(self.tempdir.name, cache_filename("returning", self.body, "session"))
+        session_file.write_bytes(b"session")
+        self.proxy._restore = Mock(return_value=3)
+        self.proxy._save = Mock(return_value=4)
+        self.proxy._schedule_prefix_seed = Mock()
+
+        _request, plan = self.proxy.prepare(self.body, "returning")
+        self.proxy.finish(plan, 200)
+
+        self.proxy._schedule_prefix_seed.assert_called_once()
+
+    def test_hot_session_without_golden_still_schedules_first_seed(self):
+        key = cache_key(self.body)
+        self.proxy.session_states["hot"] = SlotState(0, key, 4)
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 4}])
+        self.proxy._save = Mock(return_value=4)
+        self.proxy._schedule_prefix_seed = Mock()
+
+        _request, plan = self.proxy.prepare(self.body, "hot")
+        self.proxy.finish(plan, 200)
+
+        self.proxy._schedule_prefix_seed.assert_called_once()
+
+    def test_shared_prefix_rejects_changed_early_tokens_short_lcp_and_wrong_scope(self):
+        self._write_shared("local-llm-prefix-changed.bin", [1, 7, 3])
+        self._write_shared("local-llm-prefix-wrong-scope.bin", [1, 2, 3], scope="other")
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 9))
+        self.proxy._restore = Mock(return_value=3)
+
+        request, _plan = self.proxy.prepare(self.body, "session-new")
+
+        self.assertNotIn("id_slot", request)
+        self.proxy._restore.assert_not_called()
+
+    def test_shared_prefix_ignores_malformed_orphan_mismatched_and_oversized_manifests(self):
+        Path(self.tempdir.name, "local-llm-prefix-bad.bin.manifest.json").write_text("not-json")
+        orphan_name = "local-llm-prefix-missing.bin"
+        orphan = PrefixManifest("default", "default", orphan_name, (1, 2, 3))
+        Path(self.tempdir.name, manifest_filename(orphan_name)).write_text(orphan.to_json())
+        alias_name = "local-llm-prefix-alias.bin"
+        alias = PrefixManifest("default", "default", "local-llm-prefix-other.bin", (1, 2, 3))
+        Path(self.tempdir.name, manifest_filename(alias_name)).write_text(alias.to_json())
+        Path(self.tempdir.name, "local-llm-prefix-oversized.bin.manifest.json").write_bytes(
+            b"x" * (MAX_METADATA_BYTES + 1)
+        )
+        self.proxy.minimum_shared_prefix_tokens = 1
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
+        self.proxy._restore = Mock(return_value=3)
+
+        request, _plan = self.proxy.prepare(self.body, "session-new")
+
+        self.assertNotIn("id_slot", request)
+        self.proxy._restore.assert_not_called()
+
+    def test_failed_shared_restore_does_not_suppress_first_exact_seed(self):
+        self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._restore = Mock(side_effect=RuntimeError("incompatible"))
+
+        request, plan = self.proxy.prepare(self.body, "new-session")
+
+        self.assertNotIn("id_slot", request)
+        self.assertFalse(plan.prefix_was_present)
+
+    def test_render_tokens_rejects_non_object_tokenizer_response(self):
+        self.proxy._json_request = Mock(side_effect=[{"prompt": "rendered"}, [1, 2, 3]])
+
+        with self.assertRaises(TypeError):
+            self.proxy._render_tokens(self.body)
+
+    def test_render_or_tokenize_failure_falls_back_to_exact_legacy_prefix_without_leaking_data(self):
+        prefix = Path(self.tempdir.name, cache_filename("prefix", self.body, "prefix"))
+        prefix.write_bytes(b"legacy")
+        private = "rendered-secret-that-must-not-be-logged"
+        self.proxy._json_request = Mock(side_effect=[{"prompt": private}, RuntimeError("tokenizer unavailable")])
+        self.proxy._restore = Mock(return_value=2)
+
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            request, plan = self.proxy.prepare(self.body, "private-session")
+
+        self.assertEqual(request["id_slot"], 0)
+        self.proxy._restore.assert_called_once_with(0, prefix)
+        rendered_logs = str(log.call_args_list)
+        self.assertNotIn(private, rendered_logs)
+        self.assertNotIn("private-session", rendered_logs)
+        self.assertFalse(plan.prefix_was_present)
+
+    def test_legacy_exact_prefix_restore_schedules_golden_migration(self):
+        prefix = Path(self.tempdir.name, cache_filename("prefix", self.body, "prefix"))
+        prefix.write_bytes(b"legacy")
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
+        self.proxy._restore = Mock(return_value=3)
+        self.proxy._save = Mock(return_value=4)
+        self.proxy._schedule_prefix_seed = Mock()
+
+        _request, plan = self.proxy.prepare(self.body, "new-session")
+        self.proxy.finish(plan, 200)
+
+        self.proxy._schedule_prefix_seed.assert_called_once()
+
     def test_session_snapshot_is_saved_and_restored(self):
         request, plan = self.proxy.prepare(self.body, "session-a")
         self.assertNotIn("id_slot", request)
@@ -304,6 +496,17 @@ class CacheProxyTests(unittest.TestCase):
     def test_invalid_upstream_url_is_rejected(self):
         with self.assertRaises(ValueError):
             LlamaCacheProxy(upstream="https://example.test")
+
+    def test_invalid_shared_prefix_configuration_is_rejected(self):
+        kwargs = {
+            "upstream": f"http://127.0.0.1:{self.server.server_port}",
+            "cache_dir": self.tempdir.name,
+        }
+        with self.assertRaises(ValueError):
+            LlamaCacheProxy(**kwargs, shared_prefix_scope=" ")
+        for minimum in (True, 0, 1.5):
+            with self.subTest(minimum=minimum), self.assertRaises(ValueError):
+                LlamaCacheProxy(**kwargs, minimum_shared_prefix_tokens=minimum)
 
     def test_finish_ignores_unsuccessful_response(self):
         _, plan = self.proxy.prepare(self.body, "session-a")
@@ -780,6 +983,20 @@ class CacheProxyTests(unittest.TestCase):
 
         self.assertIsNone(restored)
 
+    def test_generic_restore_count_mismatch_keeps_source_when_not_shared(self):
+        source = Path(self.tempdir.name, "private-session.bin")
+        source.write_bytes(b"snapshot")
+        self.proxy._restore = Mock(return_value=2)
+
+        restored = self.proxy._restore_first_available(
+            0,
+            (source,),
+            expected_tokens=3,
+        )
+
+        self.assertIsNone(restored)
+        self.assertTrue(source.exists())
+
     def test_hot_session_finish_keeps_pinned_slot(self):
         _, first_plan = self.proxy.prepare(self.body, "session-a")
         self.proxy.finish(first_plan, 200)
@@ -820,10 +1037,13 @@ class CacheProxyTests(unittest.TestCase):
             ]
         )
         self.proxy._json_request = Mock(return_value={})
-        self.proxy._save = Mock(return_value=10)
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (target.write_bytes(b"snapshot"), 3)[1]
+        )
         self.proxy._forget_slot = Mock()
         self.proxy._prune = Mock()
-        prefix_file = Path(self.tempdir.name, "prefix.bin")
+        prefix_file = Path(self.tempdir.name, "local-llm-prefix-test.bin")
 
         self.proxy._seed_prefix(
             {"messages": [{"role": "system", "content": "rules"}]},
@@ -831,10 +1051,232 @@ class CacheProxyTests(unittest.TestCase):
             excluded_slot_id=1,
         )
 
-        request = self.proxy._json_request.call_args.args[2]
-        self.assertEqual(request["id_slot"], 0)
+        method, path, request = self.proxy._json_request.call_args.args
+        self.assertEqual((method, path), ("POST", "/completion"))
+        self.assertEqual(
+            request,
+            {
+                "prompt": [1, 2, 3],
+                "cache_prompt": False,
+                "n_predict": 0,
+                "stream": False,
+                "id_slot": 0,
+            },
+        )
         self.proxy._save.assert_called_once_with(0, prefix_file)
         self.proxy._prune.assert_called_once_with()
+
+    def test_prefix_seed_count_mismatch_removes_unpublished_pair_without_private_logs(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False}])
+        private_prompt = "private prompt must never be logged"
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
+        self.proxy._json_request = Mock(return_value={})
+        prefix_file = Path(self.tempdir.name, "local-llm-prefix-mismatch.bin")
+        manifest_file = Path(self.tempdir.name, manifest_filename(prefix_file.name))
+
+        def mismatched_save(_slot, target, **_kwargs):
+            target.write_bytes(private_prompt.encode())
+            return 2
+
+        self.proxy._save = Mock(side_effect=mismatched_save)
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            self.proxy._seed_prefix(
+                {"messages": [{"role": "system", "content": private_prompt}]},
+                prefix_file,
+                excluded_slot_id=1,
+            )
+
+        self.assertFalse(prefix_file.exists())
+        self.assertFalse(manifest_file.exists())
+        self.assertNotIn(private_prompt, str(log.call_args_list))
+        self.assertIn("prefix_seed_token_count_mismatch", str(log.call_args_list))
+
+    def test_prefix_seed_stops_if_foreground_arrives_after_token_discovery(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False}])
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
+        self.proxy._has_foreground_waiters = Mock(side_effect=[False, True])
+        self.proxy._json_request = Mock()
+        self.proxy._save = Mock()
+
+        self.proxy._seed_prefix(self.body, Path(self.tempdir.name, "local-llm-prefix-wait.bin"), 1)
+
+        self.proxy._json_request.assert_not_called()
+        self.proxy._save.assert_not_called()
+
+    def test_manifest_publish_failure_preserves_old_valid_pair_and_removes_new_snapshot(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False}])
+        self.proxy._render_tokens = Mock(return_value=(4, 5, 6))
+        self.proxy._json_request = Mock(return_value={})
+        prefix_file = self._write_shared("local-llm-prefix-existing.bin", [1, 2, 3])
+        manifest_file = Path(self.tempdir.name, manifest_filename(prefix_file.name))
+        old_manifest = manifest_file.read_bytes()
+
+        def save_new(_slot, target, **_kwargs):
+            target.write_bytes(b"new snapshot")
+            return 3
+
+        self.proxy._save = Mock(side_effect=save_new)
+        self.proxy._write_manifest = Mock(side_effect=OSError("disk full"))
+
+        self.proxy._seed_prefix(self.body, prefix_file, excluded_slot_id=1)
+
+        self.assertEqual(prefix_file.read_bytes(), b"snapshot")
+        self.assertEqual(manifest_file.read_bytes(), old_manifest)
+        snapshots = list(Path(self.tempdir.name).glob("local-llm-prefix-*.bin"))
+        self.assertEqual(snapshots, [prefix_file])
+
+    def test_write_manifest_requires_snapshot(self):
+        with self.assertRaises(RuntimeError):
+            self.proxy._write_manifest(Path(self.tempdir.name, "missing.bin"), (1, 2))
+
+    def test_one_slot_seed_saves_clean_owner_writes_manifest_then_restores(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        owner_file = Path(self.tempdir.name, "owner.bin")
+        owner_file.write_bytes(b"persisted")
+        self.proxy.session_states = {
+            "owner": SlotState(0, "key", 10, owner_file, False),
+        }
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}])
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
+        prefix_file = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
+        events = []
+
+        def save(slot, target, **_kwargs):
+            events.append(("save", target.name))
+            target.write_bytes(b"snapshot")
+            return 10 if target.name.endswith(".seed-owner.tmp") else 3
+
+        self.proxy._save = Mock(side_effect=save)
+        self.proxy._json_request = Mock(side_effect=lambda *_args: events.append(("seed", None)) or {})
+        self.proxy._restore = Mock(side_effect=lambda _slot, source: events.append(("restore", source.name)) or 10)
+
+        self.proxy._seed_prefix(self.body, prefix_file, excluded_slot_id=0)
+
+        self.assertEqual(
+            events,
+            [
+                ("save", "owner.bin.seed-owner.tmp"),
+                ("seed", None),
+                ("save", prefix_file.name),
+                ("restore", "owner.bin.seed-owner.tmp"),
+            ],
+        )
+        manifest_path = Path(self.tempdir.name, manifest_filename(prefix_file.name))
+        manifest = PrefixManifest.from_json(manifest_path.read_bytes())
+        self.assertEqual(manifest.tokens, (1, 2, 3))
+        self.assertEqual(manifest.snapshot, prefix_file.name)
+        self.assertEqual(manifest_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.proxy.session_states["owner"].slot_id, 0)
+
+    def test_one_slot_seed_skips_dirty_missing_mismatched_or_waiting_owner(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        owner_file = Path(self.tempdir.name, "owner.bin")
+        owner_file.write_bytes(b"persisted")
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}])
+        self.proxy._json_request = Mock()
+        self.proxy._save = Mock()
+        prefix = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
+        for state in (
+            SlotState(0, "key", 10, owner_file, True),
+            SlotState(0, "key", 10, Path(self.tempdir.name, "missing.bin"), False),
+            SlotState(0, "key", 9, owner_file, False),
+        ):
+            with self.subTest(state=state):
+                self.proxy.session_states = {"owner": state}
+                self.proxy._seed_prefix(self.body, prefix, 0)
+        self.proxy.foreground_waiters = 1
+        self.proxy.session_states = {"owner": SlotState(0, "key", 10, owner_file, False)}
+        self.proxy._seed_prefix(self.body, prefix, 0)
+
+        self.proxy._json_request.assert_not_called()
+        self.proxy._save.assert_not_called()
+
+    def test_one_slot_seed_failure_rolls_back_and_restore_failure_forgets_hot_owner(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        owner_file = Path(self.tempdir.name, "owner.bin")
+        owner_file.write_bytes(b"persisted")
+        prefix = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
+        self.proxy.session_states = {"owner": SlotState(0, "key", 10, owner_file, False)}
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}])
+        self.proxy._render_tokens = Mock(return_value=(1, 2))
+        self.proxy._save = Mock(return_value=10)
+        self.proxy._json_request = Mock(side_effect=RuntimeError("seed failed"))
+        self.proxy._restore = Mock(return_value=10)
+
+        self.proxy._seed_prefix(self.body, prefix, 0)
+
+        self.proxy._restore.assert_called_once_with(
+            0, owner_file.with_suffix(".bin.seed-owner.tmp")
+        )
+        self.assertIn("owner", self.proxy.session_states)
+        self.assertFalse(prefix.exists())
+
+        self.proxy._json_request = Mock(return_value={})
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (
+                target.write_bytes(b"x"),
+                10 if target.name.endswith(".seed-owner.tmp") else 2,
+            )[1]
+        )
+        self.proxy._restore = Mock(side_effect=RuntimeError("restore failed"))
+        self.proxy._seed_prefix(self.body, prefix, 0)
+
+        self.assertNotIn("owner", self.proxy.session_states)
+        self.assertTrue(owner_file.exists())
+
+    def test_one_slot_seed_keeps_known_good_owner_when_guard_save_count_mismatches(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        owner_file = Path(self.tempdir.name, "owner.bin")
+        owner_file.write_bytes(b"known-good")
+        prefix = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
+        original_state = SlotState(0, "key", 10, owner_file, False)
+        self.proxy.session_states = {"owner": original_state}
+        self.proxy._slots = Mock(
+            return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}]
+        )
+        self.proxy._render_tokens = Mock(return_value=(1, 2))
+        self.proxy._json_request = Mock(return_value={})
+
+        def mismatched_guard_save(_slot, target, **_kwargs):
+            target.write_bytes(b"bad-guard")
+            return 9
+
+        self.proxy._save = Mock(side_effect=mismatched_guard_save)
+        self.proxy._restore = Mock()
+
+        self.proxy._seed_prefix(self.body, prefix, 0)
+
+        self.assertEqual(owner_file.read_bytes(), b"known-good")
+        self.assertEqual(self.proxy.session_states["owner"], original_state)
+        self.assertFalse(owner_file.with_suffix(".bin.seed-owner.tmp").exists())
+        self.proxy._restore.assert_not_called()
+        self.proxy._json_request.assert_not_called()
+
+    def test_one_slot_seed_forgets_owner_on_restore_count_mismatch(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        owner_file = Path(self.tempdir.name, "owner.bin")
+        owner_file.write_bytes(b"persisted")
+        prefix = Path(self.tempdir.name, "local-llm-prefix-golden.bin")
+        self.proxy.session_states = {"owner": SlotState(0, "key", 10, owner_file, False)}
+        self.proxy._slots = Mock(
+            return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}]
+        )
+        self.proxy._render_tokens = Mock(return_value=(1, 2))
+        self.proxy._json_request = Mock(return_value={})
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (
+                target.write_bytes(b"x"),
+                10 if target.name.endswith(".seed-owner.tmp") else 2,
+            )[1]
+        )
+        self.proxy._restore = Mock(return_value=9)
+
+        self.proxy._seed_prefix(self.body, prefix, 0)
+
+        self.assertNotIn("owner", self.proxy.session_states)
 
     def test_prefix_seed_skips_when_foreground_is_waiting_or_proxy_is_busy(self):
         self.proxy.prefix_seed_delay_seconds = 0
@@ -1136,10 +1578,14 @@ class CacheProxyTests(unittest.TestCase):
         with patch("cache_proxy.HTTPConnection", return_value=empty):
             self.assertEqual(self.proxy._json_request("POST", "/test", {}), {})
 
-        failed = FakeConnection("host", 80, response=FakeResponse(status=500, raw=b"bad"))
+        failed = FakeConnection(
+            "host", 80, response=FakeResponse(status=500, raw=b"SECRET_PROMPT_CONTENT")
+        )
         with patch("cache_proxy.HTTPConnection", return_value=failed):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(RuntimeError) as raised:
                 self.proxy._json_request("POST", "/test", {})
+        self.assertEqual(str(raised.exception), "llama POST /test returned 500")
+        self.assertNotIn("SECRET_PROMPT_CONTENT", str(raised.exception))
         self.assertTrue(failed.closed)
 
         slots = FakeConnection("host", 80, response=FakeResponse(raw=b'[{"id": 0}]'))
@@ -1567,6 +2013,36 @@ class CacheProxyTests(unittest.TestCase):
         proxy._prune()
 
         self.assertFalse(snapshot.exists())
+
+    def test_prune_removes_prefix_manifest_with_snapshot(self):
+        snapshot = self._write_shared("local-llm-prefix-old.bin", [1, 2])
+        manifest = Path(self.tempdir.name, manifest_filename(snapshot.name))
+        self.proxy.max_cache_bytes = 0
+
+        self.proxy._prune()
+
+        self.assertFalse(snapshot.exists())
+        self.assertFalse(manifest.exists())
+
+    def test_prune_removes_orphan_manifest_and_temporary_metadata(self):
+        orphan = Path(
+            self.tempdir.name,
+            "local-llm-prefix-orphan.bin.manifest.json",
+        )
+        temporary_snapshot = Path(self.tempdir.name, "local-llm-session-save.bin.tmp")
+        temporary_manifest = Path(
+            self.tempdir.name,
+            "local-llm-prefix-seed.bin.manifest.json.tmp",
+        )
+        orphan.write_text("{}")
+        temporary_snapshot.write_bytes(b"partial")
+        temporary_manifest.write_text("partial")
+
+        self.proxy._prune()
+
+        self.assertFalse(orphan.exists())
+        self.assertFalse(temporary_snapshot.exists())
+        self.assertFalse(temporary_manifest.exists())
 
     def test_restore_refreshes_snapshot_lru_timestamp(self):
         snapshot = Path(self.tempdir.name, "local-llm-session-old.bin")

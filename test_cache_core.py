@@ -3,9 +3,14 @@ import unittest
 from unittest.mock import patch
 
 from cache_core import (
+    PrefixManifest,
+    best_prefix_manifest,
     build_prefix_payload,
     cache_key,
     cache_filename,
+    longest_common_prefix,
+    manifest_filename,
+    normalize_tokens,
     with_slot_cache,
 )
 
@@ -98,6 +103,63 @@ class CacheCoreTests(unittest.TestCase):
             model_b = cache_filename("session", self.body, "session")
 
         self.assertNotEqual(model_a, model_b)
+
+    def test_token_normalization_and_exact_lcp(self):
+        self.assertEqual(normalize_tokens([1, 2, 0]), (1, 2, 0))
+        self.assertEqual(longest_common_prefix((1, 2, 3), (1, 2, 4, 5)), 2)
+        self.assertEqual(longest_common_prefix((1, 2), (1, 2)), 2)
+        for malformed in ([], [1, True], [1, -1], [1, 2**31], "1,2", None):
+            with self.subTest(malformed=malformed), self.assertRaises(ValueError):
+                normalize_tokens(malformed)
+
+    def test_manifest_round_trip_is_immutable_and_deterministic(self):
+        manifest = PrefixManifest("private", "runtime-a", "prefix.bin", (11, 12, 13))
+        encoded = manifest.to_json()
+
+        self.assertEqual(PrefixManifest.from_json(encoded), manifest)
+        self.assertEqual(manifest_filename("prefix.bin"), "prefix.bin.manifest.json")
+        self.assertNotIn("prompt", encoded)
+        with self.assertRaises(AttributeError):
+            manifest.tokens = (1,)
+
+    def test_manifest_rejects_malformed_scope_namespace_and_tokens(self):
+        valid = {"version": 1, "namespace": "private", "scope": "runtime-a", "snapshot": "prefix.bin", "tokens": [1, 2]}
+        malformed = [
+            {},
+            {**valid, "version": 2},
+            {**valid, "namespace": ""},
+            {**valid, "scope": ""},
+            {**valid, "snapshot": "../prefix.bin"},
+            {**valid, "tokens": [1, "2"]},
+            {**valid, "extra": True},
+        ]
+        for value in malformed:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                PrefixManifest.from_json(__import__("json").dumps(value))
+        for raw in (b"\xff", None):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                PrefixManifest.from_json(raw)
+
+        for snapshot in ("", "../prefix.bin", 42):
+            with self.subTest(snapshot=snapshot), self.assertRaises(ValueError):
+                manifest_filename(snapshot)
+
+    def test_best_manifest_requires_scope_and_selects_longest_exact_candidate(self):
+        candidates = [
+            PrefixManifest("private", "runtime-a", "short.bin", (1, 2)),
+            PrefixManifest("other", "runtime-a", "wrong-namespace.bin", (1, 2, 3, 4)),
+            PrefixManifest("private", "runtime-b", "wrong-scope.bin", (1, 2, 3, 4)),
+            PrefixManifest("private", "runtime-a", "changed-skill.bin", (1, 2, 9, 4)),
+            PrefixManifest("private", "runtime-a", "long.bin", (1, 2, 3, 4)),
+        ]
+
+        selected = best_prefix_manifest(candidates, (1, 2, 3, 8), "private", "runtime-a", minimum_lcp=2)
+
+        self.assertEqual(selected, (candidates[-1], 3))
+        self.assertIsNone(best_prefix_manifest(candidates, (7, 8), "private", "runtime-a", minimum_lcp=2))
+        for minimum in (True, 0, 1.5):
+            with self.subTest(minimum=minimum), self.assertRaises(ValueError):
+                best_prefix_manifest(candidates, (1, 2), "private", "runtime-a", minimum)
 
 
 if __name__ == "__main__":
