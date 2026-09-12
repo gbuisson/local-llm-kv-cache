@@ -9,6 +9,7 @@ from contextlib import contextmanager
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any, cast
 from unittest.mock import Mock, patch
 
 import cache_proxy
@@ -498,7 +499,7 @@ class CacheProxyTests(unittest.TestCase):
             LlamaCacheProxy(upstream="https://example.test")
 
     def test_invalid_shared_prefix_configuration_is_rejected(self):
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "upstream": f"http://127.0.0.1:{self.server.server_port}",
             "cache_dir": self.tempdir.name,
         }
@@ -507,6 +508,26 @@ class CacheProxyTests(unittest.TestCase):
         for minimum in (True, 0, 1.5):
             with self.subTest(minimum=minimum), self.assertRaises(ValueError):
                 LlamaCacheProxy(**kwargs, minimum_shared_prefix_tokens=minimum)
+        for timeout in (True, False, 0, -1, float("nan"), float("inf"), float("-inf"), "600", None):
+            with self.subTest(timeout=timeout), self.assertRaises(ValueError):
+                LlamaCacheProxy(
+                    **kwargs,
+                    prefix_seed_timeout_seconds=cast(Any, timeout),
+                )
+
+    def test_new_seed_timeout_preserves_old_positional_constructor_contract(self):
+        proxy = LlamaCacheProxy(
+            f"http://127.0.0.1:{self.server.server_port}",
+            self.tempdir.name,
+            1,
+            120,
+            True,
+            2,
+            "terminal",
+        )
+
+        self.assertEqual(proxy.save_policy, "terminal")
+        self.assertEqual(proxy.prefix_seed_timeout_seconds, 600.0)
 
     def test_finish_ignores_unsuccessful_response(self):
         _, plan = self.proxy.prepare(self.body, "session-a")
@@ -1150,11 +1171,25 @@ class CacheProxyTests(unittest.TestCase):
             return 10 if target.name.endswith(".seed-owner.tmp") else 3
 
         self.proxy._save = Mock(side_effect=save)
-        self.proxy._json_request = Mock(side_effect=lambda *_args: events.append(("seed", None)) or {})
+        self.proxy._json_request = Mock(
+            side_effect=lambda *_args, **_kwargs: events.append(("seed", None)) or {}
+        )
         self.proxy._restore = Mock(side_effect=lambda _slot, source: events.append(("restore", source.name)) or 10)
 
         self.proxy._seed_prefix(self.body, prefix_file, excluded_slot_id=0)
 
+        self.proxy._json_request.assert_called_once_with(
+            "POST",
+            "/completion",
+            {
+                "prompt": [1, 2, 3],
+                "cache_prompt": False,
+                "n_predict": 0,
+                "stream": False,
+                "id_slot": 0,
+            },
+            timeout=600.0,
+        )
         self.assertEqual(
             events,
             [
@@ -1928,11 +1963,13 @@ class CacheProxyTests(unittest.TestCase):
             "PI_LLAMA_CACHE_MAX_GIB": "1",
             "PI_LLAMA_CACHE_WAIT_SECONDS": "1",
             "PI_LLAMA_CACHE_PREFIX_SEED_DELAY": "0",
+            "PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT": "321",
         }
         with patch.dict(os.environ, env, clear=False), patch("http.server.ThreadingHTTPServer", MainServer):
             runpy.run_path(cache_proxy.__file__, run_name="__main__")
 
         self.assertEqual(servers[0].address, ("127.0.0.1", 19082))
+        self.assertEqual(servers[0].handler.proxy.prefix_seed_timeout_seconds, 321.0)
         self.assertTrue(servers[0].closed)
 
     def test_main_handles_sigterm_and_logs_shutdown_flush_failure(self):

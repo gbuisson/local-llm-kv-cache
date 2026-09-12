@@ -34,6 +34,7 @@ curl -fsS http://127.0.0.1:18082/health
 | `PI_LLAMA_CACHE_NAMESPACE` | `default` | Invalidates snapshots across model, llama.cpp, context, or template deployments. Use a stable deployment fingerprint. |
 | `PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING` | `true` | Allows best-effort golden-prefix seeding. `-np 1` 也受支持，见下文的事务式 slot swap。 |
 | `PI_LLAMA_CACHE_PREFIX_SEED_DELAY` | `2` | 成功响应后，后台 seed 开始前的秒数；有前台等待者时 seed 会跳过。 |
+| `PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT` | `600` | `/completion` seed 的专用 HTTP timeout（秒）。应高于目标机上完整稳定 prefix 的 cold prefill 时间；不改变其他内部 API 的 120 秒 timeout。必须为正数。 |
 | `PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE` | `default` | Shared-prefix 隔离域。个人与工作环境必须使用不同的显式值，例如 `personal` 与 `work`。 |
 | `PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS` | `128` | 接受 golden 候选所需的最小 exact LCP token 数；必须为正整数。 |
 | `PI_LLAMA_CACHE_SAVE_POLICY` | `all` | `all` saves every successful response. `terminal` defers `finish_reason=tool_calls`, then saves on a terminal response, before eviction, or during clean shutdown. |

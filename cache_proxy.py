@@ -13,6 +13,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -244,6 +245,7 @@ class LlamaCacheProxy:
         require_session_id: bool = False,
         shared_prefix_scope: str | None = None,
         minimum_shared_prefix_tokens: int = 128,
+        prefix_seed_timeout_seconds: float = 600.0,
     ) -> None:
         parsed = urlsplit(upstream)
         if parsed.scheme != "http" or not parsed.hostname:
@@ -258,6 +260,14 @@ class LlamaCacheProxy:
         self.wait_seconds = wait_seconds
         self.enable_prefix_seeding = enable_prefix_seeding
         self.prefix_seed_delay_seconds = prefix_seed_delay_seconds
+        if (
+            isinstance(prefix_seed_timeout_seconds, bool)
+            or not isinstance(prefix_seed_timeout_seconds, (int, float))
+            or not math.isfinite(prefix_seed_timeout_seconds)
+            or prefix_seed_timeout_seconds <= 0
+        ):
+            raise ValueError("prefix_seed_timeout_seconds must be a finite positive number")
+        self.prefix_seed_timeout_seconds = float(prefix_seed_timeout_seconds)
         if save_policy not in {"all", "terminal"}:
             raise ValueError("save_policy must be 'all' or 'terminal'")
         self.save_policy = save_policy
@@ -746,7 +756,12 @@ class LlamaCacheProxy:
                         "id_slot": slot_id,
                     }
                     slot_changed = True
-                    self._json_request("POST", "/completion", seed_request)
+                    self._json_request(
+                        "POST",
+                        "/completion",
+                        seed_request,
+                        timeout=self.prefix_seed_timeout_seconds,
+                    )
                     seed_file = self._prefix_seed_target(prefix_file)
                     manifest_path = self.cache_dir / manifest_filename(seed_file.name)
                     n_saved = self._save(slot_id, seed_file)
@@ -979,9 +994,16 @@ class LlamaCacheProxy:
                 headers[name] = value
         return headers
 
-    def _json_request(self, method: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def _json_request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        timeout: float = 120.0,
+    ) -> dict[str, Any]:
         body = json.dumps(payload).encode("utf-8")
-        connection = HTTPConnection(self.upstream_host, self.upstream_port, timeout=120)
+        connection = HTTPConnection(self.upstream_host, self.upstream_port, timeout=timeout)
         try:
             connection.request(
                 method,
@@ -1298,6 +1320,9 @@ def main() -> None:
         wait_seconds=float(os.environ.get("PI_LLAMA_CACHE_WAIT_SECONDS", "120")),
         enable_prefix_seeding=_env_bool("PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING", True),
         prefix_seed_delay_seconds=float(os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_DELAY", "2")),
+        prefix_seed_timeout_seconds=float(
+            os.environ.get("PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT", "600")
+        ),
         save_policy=os.environ.get("PI_LLAMA_CACHE_SAVE_POLICY", "all").strip().lower(),
         require_session_id=_env_bool("PI_LLAMA_CACHE_REQUIRE_SESSION_ID", False),
         shared_prefix_scope=os.environ.get("PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE"),

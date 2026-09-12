@@ -373,6 +373,8 @@ prefix seed 使用：
 
 有 spare unowned idle slot 时使用 spare。没有 spare（尤其 `-np 1`）时，只有 excluded owner 已 idle、clean、其 slot token 数与记录一致且完整 session snapshot 已存在，才允许事务式 swap。代理持有 operation lock，先把 owner 保存到独立 guard snapshot 并验证 `n_saved`，再用 `/completion` 的 token-array prompt 执行 seed 和 atomic snapshot save。token identity 由传给 `/completion` 的 exact IDs 保证；`n_saved == len(tokens)` 只是额外完整性检查。两者成立后才原子发布 manifest；计数不一致或发布失败会删除 shared pair。shared restore 同样要求 `n_restored == len(manifest.tokens)`，否则删除损坏候选并 fallback。manifest 永远不应指向缺失、部分写入或未经验证的 snapshot。一旦 seed 请求可能改变 slot，无论 seed/save 是否成功，都在 `finally` 从 guard 恢复 owner，并验证 `n_restored == owner.n_tokens` 后才释放 lock。恢复失败或计数不符只清除该 slot 的 hot ownership，原始持久化 session snapshot 保留供后续恢复。
 
+`/completion` seed 使用独立的 `PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT`（默认 600 秒），因为完整 prefix cold prefill 可以显著超过通用内部 API 的 120 秒 timeout。该值只作用于 seed completion；apply-template、tokenize、slot save/restore 等调用仍使用通用 timeout。超时仍走同一事务 rollback，且不会发布 manifest。
+
 dirty owner、缺失 snapshot、slot token mismatch、seed `n_saved` mismatch、前台等待、busy lock、render/tokenize/seed/save/manifest 失败都跳过或回滚，不影响前台正确性。已经按 shared 规则尝试并拒绝的文件，在同一次 `prepare` 中不得降级为无 token-count 校验的 legacy exact restore；即使 read-only filesystem 阻止物理删除，也必须继续 cold。成功恢复一个 shared golden 后，该请求不会因为日期等尾部小差异再创建一个近重复 exact snapshot。`PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=true` 可用于 `-np 1`；不再要求因为只有一个 slot 而禁用。首次 seed 仍支付一次额外 prefix prefill、snapshot I/O 和 manifest 写入成本。
 
 ## 9. 缓存不是答案缓存
