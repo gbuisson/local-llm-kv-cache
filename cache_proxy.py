@@ -952,7 +952,11 @@ class LlamaCacheProxy:
         metadata_buffer = bytearray()
         try:
             while True:
-                chunk = response.read(64 * 1024)
+                # ``HTTPResponse.read(size)`` waits for ``size`` bytes or EOF and
+                # therefore buffers small SSE events until generation completes.
+                # ``read1`` returns data from a single underlying socket read, so
+                # each available upstream fragment can be flushed immediately.
+                chunk = response.read1(64 * 1024)
                 if not chunk:
                     break
                 metadata_buffer.extend(chunk)

@@ -58,6 +58,12 @@ The public route contract is explicit and fail-closed:
 
 For clients that consistently prefix llama.cpp utility routes with `/v1`, the proxy maps `GET`/`HEAD /v1/props` to `/props` and maps `POST /v1/tokenize`, `/v1/detokenize`, and `/v1/apply-template` to their native unprefixed endpoints. `HEAD` suppresses the upstream response body, while `OPTIONS` and its CORS preflight request headers pass through unchanged.
 
+### Streaming contract
+
+Streaming responses are relayed incrementally. The proxy reads one available upstream socket fragment with `HTTPResponse.read1()` and immediately writes a valid HTTP/1.1 chunk and flushes it downstream. Do not replace this with `HTTPResponse.read(size)`: that API may wait for `size` bytes or EOF and turn a token stream into a response delivered all at once. Upstream hop-by-hop framing is removed, the downstream response is emitted with `Transfer-Encoding: chunked`, SSE payloads and `[DONE]` remain byte-for-byte unchanged, and only a bounded tail is retained for completion metadata.
+
+The regression test `test_forward_streams_body_and_filters_hop_by_hop_headers` requires multiple upstream fragments to remain multiple downstream chunks and asserts that the forwarding path uses `read1`, not buffering `read`. A production timing probe should show the first `data:` event before the final event and a non-zero event-time spread during a multi-token generation.
+
 Operational events are emitted as compact JSON. Session identifiers、rendered prompt、token ID 数组和 manifest 内容都不会写入日志；`session_ref` 是可用于关联的截断 SHA-256。Shared-prefix 事件只记录候选 token 数和验证后的 LCP 长度等计数。
 
 ### Context compaction

@@ -142,13 +142,25 @@ class FakeResponse:
         self._raw = raw
         self._headers = headers or []
         self._chunks = list(chunks) if chunks is not None else None
+        self.read_calls = 0
+        self.read1_calls = 0
 
     def getheaders(self):
         return self._headers
 
     def read(self, _size=None):
+        self.read_calls += 1
         if self._chunks is None:
             return self._raw
+        if self._chunks:
+            return self._chunks.pop(0)
+        return b""
+
+    def read1(self, _size=None):
+        self.read1_calls += 1
+        if self._chunks is None:
+            raw, self._raw = self._raw, b""
+            return raw
         if self._chunks:
             return self._chunks.pop(0)
         return b""
@@ -1448,7 +1460,7 @@ class CacheProxyTests(unittest.TestCase):
         response = FakeResponse(
             status=201,
             headers=[("Content-Type", "text/plain"), ("Content-Length", "2"), ("Connection", "close")],
-            chunks=[b"ok"],
+            chunks=[b"o", b"k"],
         )
         connection = FakeConnection("host", 80, response=response)
         handler = RecordingHandler(
@@ -1470,7 +1482,9 @@ class CacheProxyTests(unittest.TestCase):
         self.assertNotIn(("Connection", "close"), handler.sent_headers)
         self.assertNotIn(("Content-Length", "2"), handler.sent_headers)
         self.assertIn(("Transfer-Encoding", "chunked"), handler.sent_headers)
-        self.assertEqual(b"".join(handler.wfile.data), b"2\r\nok\r\n0\r\n\r\n")
+        self.assertEqual(b"".join(handler.wfile.data), b"1\r\no\r\n1\r\nk\r\n0\r\n\r\n")
+        self.assertEqual(response.read_calls, 0)
+        self.assertEqual(response.read1_calls, 3)
         self.assertTrue(connection.closed)
 
     def test_forward_head_preserves_content_length_without_writing_a_body(self):
