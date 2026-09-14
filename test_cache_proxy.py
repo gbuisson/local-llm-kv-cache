@@ -320,18 +320,21 @@ class CacheProxyTests(unittest.TestCase):
             shared_prefix_verified_lcp=3,
         )
         self.proxy._save = Mock(return_value=4)
+        self.proxy._schedule_prefix_seed = Mock()
 
         with patch.object(cache_proxy.LOGGER, "log") as log:
             self.proxy.finish(plan, 200, cached_tokens=3)
         rendered = str(log.call_args_list)
         self.assertIn("shared_prefix_effective_hit", rendered)
         self.assertNotIn("shared_prefix_rejected_by_llama", rendered)
+        self.proxy._schedule_prefix_seed.assert_not_called()
 
         with patch.object(cache_proxy.LOGGER, "log") as log:
             self.proxy.finish(plan, 200, cached_tokens=0)
         rendered = str(log.call_args_list)
         self.assertIn("shared_prefix_rejected_by_llama", rendered)
         self.assertNotIn("shared_prefix_effective_hit", rendered)
+        self.proxy._schedule_prefix_seed.assert_called_once()
 
     def test_shared_restore_requires_manifest_token_count(self):
         snapshot = self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])

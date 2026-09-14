@@ -452,7 +452,7 @@ shared discovery 的 `/apply-template`/`/tokenize` API 失败或 malformed respo
 - snapshot 与 manifest 都是私有数据。manifest 的 token IDs 可由同一 tokenizer detokenize，具有可逆性，不是匿名化 hash；目录必须保持 `0700`，snapshot/manifest 保持 `0600`，且 personal/work 使用不同 shared scope；
 - 结构化日志不得包含 prompt、rendered text、token IDs 或 manifest body，只记录 `session_ref`、layer、`candidate_tokens`、`verified_lcp`、时延和错误类型等元数据。
 
-运行验收必须包含 cold-vs-golden A/B：清除 prefix 文件，以禁用 seeding 的全新 session 测 cold；再启用 seeding，等待首个 seed 完成，并以不同 affinity 发出仅在较晚 skill/date/memory/suffix 处分歧的请求。要求先有 `shared_prefix_candidate_restored`，再由响应 metadata 产生 `shared_prefix_effective_hit` 且 API `cached_tokens`/`timings.cache_n > 0`、TTFT 改善；`shared_prefix_rejected_by_llama` 表示 snapshot restore 成功但 native LCP 没有形成实际 KV hit，不能计为命中。改变早期 token 时必须观察到更短 LCP、rejected 或 cold。运维 purge、只显示计数而不泄露 token 的 manifest 诊断和具体 systemd 命令见 [README.md](./README.md#运行和排查)。
+运行验收必须包含 cold-vs-golden A/B：清除 prefix 文件，以禁用 seeding 的全新 session 测 cold；再启用 seeding，等待首个 seed 完成，并以不同 affinity 发出仅在较晚 skill/date/memory/suffix 处分歧的请求。要求先有 `shared_prefix_candidate_restored`，再由响应 metadata 产生 `shared_prefix_effective_hit` 且 API `cached_tokens`/`timings.cache_n > 0`、TTFT 改善；`shared_prefix_rejected_by_llama` 表示 snapshot restore 成功但 native LCP 没有形成实际 KV hit，不能计为命中，并触发当前 exact prefix 的 best-effort seed。改变早期 token 时必须观察到更短 LCP、rejected 或 cold。运维 purge、只显示计数而不泄露 token 的 manifest 诊断和具体 systemd 命令见 [README.md](./README.md#运行和排查)。
 
 ## 12. 关键文件
 

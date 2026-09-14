@@ -610,7 +610,9 @@ class LlamaCacheProxy:
                 verified_lcp=plan.shared_prefix_verified_lcp,
                 cached_tokens=cached_tokens,
             )
-        if not plan.prefix_was_present:
+        if not plan.prefix_was_present or (
+            plan.shared_prefix_candidate_tokens is not None and cached_tokens == 0
+        ):
             self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
         if did_save:
             self._prune()
