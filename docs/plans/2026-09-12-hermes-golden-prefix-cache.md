@@ -10,30 +10,34 @@
 
 ---
 
-### Task 1: Add token-manifest primitives
+## Task 1: Add token-manifest primitives
 
 **Objective:** Represent and validate private prefix manifests and select the longest exact token prefix without relying on prompt text or heuristic metadata.
 
 **Files:**
+
 - Modify: `cache_core.py`
 - Modify: `test_cache_core.py`
 
 **Steps:**
+
 1. Add failing tests for exact token normalization, longest-common-prefix length, scope/namespace mismatch, malformed manifests, changed skill/tool token sequences, and longest valid candidate selection.
 2. Run the focused tests and verify RED.
 3. Implement immutable manifest serialization/validation helpers with bounded integer token arrays and deterministic companion filenames.
 4. Require exact token equality for every reused position; never accept a candidate on hash or ratio alone.
 5. Run focused tests and the full suite.
 
-### Task 2: Render/tokenize and restore a safe shared candidate
+## Task 2: Render/tokenize and restore a safe shared candidate
 
 **Objective:** Make `prepare()` compute the actual rendered request tokens and restore only the longest validated shared candidate in the same deployment scope.
 
 **Files:**
+
 - Modify: `cache_proxy.py`
 - Modify: `test_cache_proxy.py`
 
 **Steps:**
+
 1. Add failing tests for `/apply-template` then `/tokenize`, exact snapshot preference, partial LCP selection, changed-skill divergence, zero/short-LCP rejection, malformed/orphan manifest rejection, API failure fallback, and no raw prompt/session leakage.
 2. Verify RED.
 3. Implement local rendering/tokenization with strict response validation and configurable minimum shared prefix length.
@@ -42,15 +46,17 @@
 6. Emit structured telemetry with candidate token count and verified LCP only, never prompt/token contents.
 7. Run focused and full tests.
 
-### Task 3: Add transactional one-slot seeding
+## Task 3: Add transactional one-slot seeding
 
 **Objective:** Create golden prefix snapshots safely on an `np=1` server without losing or corrupting the current session.
 
 **Files:**
+
 - Modify: `cache_proxy.py`
 - Modify: `test_cache_proxy.py`
 
 **Steps:**
+
 1. Add failing tests for clean-owner save → seed → atomic manifest → owner restore ordering; dirty-owner skip; missing snapshot skip; foreground waiter skip; seed/save failure rollback; owner-restore failure invalidating only hot ownership; and spare-slot behavior remaining unchanged.
 2. Verify RED.
 3. Use a spare unowned slot when available. Otherwise use the excluded owner slot only when it is idle, clean, token-count-consistent, and its session snapshot exists.
@@ -60,28 +66,31 @@
 7. Restore/update ownership only when `n_restored` equals the expected owner token count; otherwise forget the hot slot and leave the original persisted session available for the next request.
 8. Run focused and full tests.
 
-### Task 4: Document the correctness and operational contract
+## Task 4: Document the correctness and operational contract
 
 **Objective:** Explain cross-session golden reuse, skill/config invalidation, privacy, one-slot maintenance cost, and rollback.
 
 **Files:**
+
 - Modify: `README.md`
 - Modify: `DESIGN.md`
 
 **Steps:**
+
 1. Document exact token-prefix validation and examples for changed skills, tools, memory, dates, templates, and reasoning modes.
 2. Document `PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE`, minimum LCP, seed delay, and `np=1` swap semantics.
 3. State that manifests contain reversible token IDs and inherit the snapshot's private-data classification.
 4. Document metrics/log events and A/B acceptance commands.
 5. Update diagrams and remove the stale statement that prefix seeding must be disabled for `np=1`.
 
-### Task 5: Quality gates and independent review
+## Task 5: Quality gates and independent review
 
 **Objective:** Prove implementation correctness before deployment.
 
 **Files:** all changed files.
 
 **Steps:**
+
 1. Run `python3 -m py_compile cache_core.py cache_proxy.py`.
 2. Run `python3 -m unittest -v`.
 3. Run branch coverage and require 100% for `cache_core.py` and `cache_proxy.py` using the existing coverage installation.
@@ -89,15 +98,17 @@
 5. Perform spec-compliance review, then code-quality/security review; fix all critical and important findings and re-run gates.
 6. Review staged blobs for secrets and unintended files.
 
-### Task 6: Nix integration and Cortex A/B
+## Task 6: Nix integration and Cortex A/B
 
 **Objective:** Deploy the immutable reviewed commit and prove the cold-prefill improvement without stale-skill reuse.
 
 **Files (in the separate private dotfiles repository):**
+
 - Modify only `packages/local-llm-kv-cache/default.nix`
 - Modify only `hosts/nixos/cortex-1.nix`
 
 **Steps:**
+
 1. Commit/push the application repo and verify local/remote SHA parity.
 2. Pin the exact commit and Nix hash; enable prefix seeding, set an explicit personal scope, conservative delay, and minimum LCP.
 3. Stage only the two intended dotfiles paths/hunks while preserving all unrelated dirty work.
