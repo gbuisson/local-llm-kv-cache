@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -260,7 +261,7 @@ class CacheProxyTests(unittest.TestCase):
         Path(self.tempdir.name, manifest_filename(name)).write_text(manifest.to_json())
         return snapshot
 
-    def test_prepare_renders_then_tokenizes_and_restores_longest_shared_prefix(self):
+    def test_prepare_seeds_verified_lcp_instead_of_restoring_divergent_snapshot(self):
         short = self._write_shared("local-llm-prefix-short.bin", [1, 2])
         longest = self._write_shared("local-llm-prefix-long.bin", [1, 2, 3, 4])
         self.proxy.minimum_shared_prefix_tokens = 2
@@ -275,24 +276,75 @@ class CacheProxyTests(unittest.TestCase):
             self.fail(path)
 
         self.proxy._json_request = Mock(side_effect=api)
-        self.proxy._restore = Mock(return_value=4)
+        self.proxy._restore = Mock()
 
         with patch.object(cache_proxy.LOGGER, "log") as log:
             request, plan = self.proxy.prepare(self.body, "new-private-session")
 
         self.assertEqual([call[0] for call in calls[:2]], ["/apply-template", "/tokenize"])
         self.assertEqual(calls[1][1], {"content": "rendered-private-prompt", "add_special": False, "parse_special": True})
-        self.assertEqual(request["id_slot"], 0)
-        self.proxy._restore.assert_called_once_with(0, longest)
+        self.assertNotIn("id_slot", request)
+        self.proxy._restore.assert_not_called()
         self.assertNotEqual(longest, short)
-        self.assertTrue(plan.prefix_was_present)
-        self.assertEqual(plan.shared_prefix_candidate_tokens, 4)
-        self.assertEqual(plan.shared_prefix_verified_lcp, 3)
+        self.assertFalse(plan.prefix_was_present)
+        self.assertEqual(plan.stable_prefix_seed_tokens, (1, 2, 3))
         rendered = str(log.call_args_list)
-        self.assertIn("shared_prefix_candidate_restored", rendered)
+        self.assertIn("shared_prefix_overlap_discovered", rendered)
+        self.assertNotIn("shared_prefix_candidate_restored", rendered)
         self.assertNotIn("shared_prefix_effective_hit", rendered)
         self.assertNotIn("shared_prefix_rejected_by_llama", rendered)
         self.assertNotIn('"cache_hit"', rendered)
+
+    def test_divergent_shared_candidate_never_falls_back_to_unscoped_legacy_prefix(self):
+        self._write_shared("local-llm-prefix-divergent.bin", [1, 2, 3])
+        legacy = Path(self.tempdir.name, cache_filename("prefix", self.body, "prefix"))
+        legacy.write_bytes(b"legacy")
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 4, 5))
+        self.proxy._restore = Mock(return_value=3)
+
+        request, plan = self.proxy.prepare(self.body, "new-session")
+
+        self.assertNotIn("id_slot", request)
+        self.proxy._restore.assert_not_called()
+        self.assertEqual(plan.stable_prefix_seed_tokens, (1, 2))
+        self.assertFalse(plan.prefix_was_present)
+
+    def test_scoped_proxy_never_restores_wrong_scope_snapshot_as_legacy(self):
+        scoped = LlamaCacheProxy(
+            upstream=f"http://127.0.0.1:{self.server.server_port}",
+            cache_dir=self.tempdir.name,
+            shared_prefix_scope="personal",
+            minimum_shared_prefix_tokens=2,
+        )
+        prefix_file = Path(self.tempdir.name, cache_filename("prefix", self.body, "prefix"))
+        prefix_file.write_bytes(b"wrong-scope")
+        manifest = PrefixManifest("default", "work", prefix_file.name, (1, 2, 3))
+        prefix_file.with_name(manifest_filename(prefix_file.name)).write_text(
+            manifest.to_json()
+        )
+        scoped._render_tokens = Mock(return_value=(1, 2, 3, 4))
+        scoped._restore = Mock(return_value=3)
+
+        request, plan = scoped.prepare(self.body, "personal-session")
+
+        self.assertNotIn("id_slot", request)
+        scoped._restore.assert_not_called()
+        self.assertFalse(plan.prefix_was_present)
+
+    def test_prepare_prefers_complete_shared_prefix_over_tied_divergent_candidate(self):
+        self._write_shared("local-llm-prefix-divergent.bin", [1, 2, 3, 4])
+        complete = self._write_shared("local-llm-prefix-complete.bin", [1, 2, 3])
+        self.proxy.minimum_shared_prefix_tokens = 2
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3, 9))
+        self.proxy._restore = Mock(return_value=3)
+
+        request, plan = self.proxy.prepare(self.body, "new-session")
+
+        self.assertEqual(request["id_slot"], 0)
+        self.proxy._restore.assert_called_once_with(0, complete)
+        self.assertTrue(plan.prefix_was_present)
+        self.assertIsNone(plan.stable_prefix_seed_tokens)
 
     def test_shared_restore_prevents_exact_reseed_at_finish(self):
         self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
@@ -340,7 +392,7 @@ class CacheProxyTests(unittest.TestCase):
         snapshot = self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
         manifest = Path(self.tempdir.name, manifest_filename(snapshot.name))
         self.proxy.minimum_shared_prefix_tokens = 2
-        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3, 4))
         self.proxy._restore = Mock(return_value=2)
 
         request, plan = self.proxy.prepare(self.body, "new-session")
@@ -353,7 +405,7 @@ class CacheProxyTests(unittest.TestCase):
     def test_shared_restore_cleanup_error_still_falls_back_cold(self):
         self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
         self.proxy.minimum_shared_prefix_tokens = 2
-        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3, 4))
         self.proxy._restore = Mock(return_value=2)
 
         with patch.object(Path, "unlink", side_effect=PermissionError("read-only")) as unlink:
@@ -368,7 +420,7 @@ class CacheProxyTests(unittest.TestCase):
         exact_name = cache_filename("prefix", self.body, "prefix")
         self._write_shared(exact_name, [1, 2, 3])
         self.proxy.minimum_shared_prefix_tokens = 2
-        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3, 4))
         self.proxy._restore = Mock(return_value=2)
 
         with patch.object(Path, "unlink", side_effect=PermissionError("read-only")):
@@ -878,6 +930,7 @@ class CacheProxyTests(unittest.TestCase):
             empty_plan.prefix_file,
             {"messages": [{"role": "system", "content": "rules"}], "tools": []},
             False,
+            stable_prefix_seed_tokens=(1, 2, 3),
         )
         self.proxy.prefix_seeds_in_flight.add(seeded_plan.prefix_file)
         with patch("cache_proxy.threading.Thread") as thread:
@@ -888,8 +941,92 @@ class CacheProxyTests(unittest.TestCase):
         with patch("cache_proxy.threading.Thread") as thread:
             thread.return_value.start = Mock()
             self.proxy._schedule_prefix_seed(seeded_plan)
-            thread.assert_called_once()
+            thread.assert_called_once_with(
+                target=self.proxy._seed_prefix,
+                args=(seeded_plan.prefix_payload, seeded_plan.prefix_file, 0, (1, 2, 3)),
+                name="local-llm-kv-prefix-seed",
+                daemon=True,
+            )
             thread.return_value.start.assert_called_once_with()
+
+    def test_deferred_stable_seed_remains_pending_and_retries_after_dirty_slot(self):
+        self.proxy.enable_prefix_seeding = True
+        self.proxy.prefix_seed_delay_seconds = 0
+        plan = SnapshotPlan(
+            "session-a",
+            0,
+            "key",
+            Path(self.tempdir.name, "session.bin"),
+            Path(self.tempdir.name, "prefix.bin"),
+            {"messages": [{"role": "system", "content": "rules"}], "tools": []},
+            False,
+            stable_prefix_seed_tokens=(1, 2, 3),
+        )
+
+        with patch("cache_proxy.threading.Thread") as thread:
+            thread.return_value.start = Mock()
+            self.proxy._schedule_prefix_seed(plan)
+            args = thread.call_args.kwargs["args"]
+        self.proxy.prefix_seeds_in_flight.clear()
+        self.proxy.session_states["session-a"] = SlotState(
+            0,
+            "key",
+            10,
+            plan.session_file,
+            True,
+        )
+        self.proxy._slots = Mock(
+            return_value=[{"id": 0, "is_processing": False, "n_prompt_tokens": 10}]
+        )
+
+        self.proxy._seed_prefix(*args)
+
+        self.assertIn(plan.prefix_file, self.proxy.pending_prefix_seeds)
+        self.assertNotIn(plan.prefix_file, self.proxy.prefix_seeds_in_flight)
+        later_plan = replace(plan, stable_prefix_seed_tokens=None)
+        with patch.object(self.proxy, "_start_pending_prefix_seed"):
+            self.proxy._schedule_prefix_seed(later_plan)
+        self.assertEqual(
+            self.proxy.pending_prefix_seeds[plan.prefix_file].stable_tokens,
+            (1, 2, 3),
+        )
+        with patch("cache_proxy.threading.Thread") as retry_thread:
+            retry_thread.return_value.start = Mock()
+            self.proxy._retry_pending_prefix_seeds()
+            retry_thread.assert_called_once()
+
+    def test_pending_seed_queue_evicts_oldest_non_running_entry(self):
+        self.proxy.enable_prefix_seeding = True
+        with patch.object(self.proxy, "_start_pending_prefix_seed"):
+            for index in range(17):
+                plan = SnapshotPlan(
+                    f"session-{index}",
+                    0,
+                    "key",
+                    Path(self.tempdir.name, f"session-{index}.bin"),
+                    Path(self.tempdir.name, f"prefix-{index}.bin"),
+                    {"messages": [{"role": "system", "content": "rules"}], "tools": []},
+                    False,
+                )
+                self.proxy._schedule_prefix_seed(plan)
+
+        self.assertEqual(len(self.proxy.pending_prefix_seeds), 16)
+        self.assertNotIn(Path(self.tempdir.name, "prefix-0.bin"), self.proxy.pending_prefix_seeds)
+
+    def test_completed_old_seed_does_not_discard_newer_longer_pending_seed(self):
+        prefix_file = Path(self.tempdir.name, "prefix.bin")
+        self.proxy.pending_prefix_seeds[prefix_file] = cache_proxy.PendingPrefixSeed(
+            {"messages": [{"role": "system", "content": "rules"}]},
+            prefix_file,
+            0,
+            (1, 2, 3),
+        )
+
+        self.proxy._discard_pending_prefix_seed(prefix_file, (1, 2))
+        self.assertIn(prefix_file, self.proxy.pending_prefix_seeds)
+
+        self.proxy._discard_pending_prefix_seed(prefix_file, (1, 2, 3))
+        self.assertNotIn(prefix_file, self.proxy.pending_prefix_seeds)
 
     def test_foreground_operation_releases_lock_on_success_and_error(self):
         with self.proxy.foreground_operation():
@@ -1135,6 +1272,39 @@ class CacheProxyTests(unittest.TestCase):
         )
         self.proxy._save.assert_called_once_with(0, prefix_file)
         self.proxy._prune.assert_called_once_with()
+
+    def test_prefix_seed_uses_verified_stable_tokens_without_rerendering_private_payload(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False}])
+        self.proxy._render_tokens = Mock(side_effect=AssertionError("must not rerender"))
+        self.proxy._json_request = Mock(return_value={})
+        self.proxy._save = Mock(
+            side_effect=lambda _slot, target, **_kwargs: (target.write_bytes(b"snapshot"), 3)[1]
+        )
+        self.proxy._forget_slot = Mock()
+        self.proxy._prune = Mock()
+        prefix_file = Path(self.tempdir.name, "local-llm-prefix-stable.bin")
+
+        self.proxy._seed_prefix(
+            {"messages": [{"role": "system", "content": "private"}]},
+            prefix_file,
+            excluded_slot_id=1,
+            stable_tokens=(1, 2, 3),
+        )
+
+        self.proxy._render_tokens.assert_not_called()
+        self.proxy._json_request.assert_called_once_with(
+            "POST",
+            "/completion",
+            {
+                "prompt": [1, 2, 3],
+                "cache_prompt": False,
+                "n_predict": 0,
+                "stream": False,
+                "id_slot": 0,
+            },
+            timeout=600.0,
+        )
 
     def test_prefix_seed_count_mismatch_removes_unpublished_pair_without_private_logs(self):
         self.proxy.prefix_seed_delay_seconds = 0

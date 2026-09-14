@@ -124,7 +124,9 @@ def best_prefix_manifest(
         lcp = longest_common_prefix(candidate.tokens, request_tokens)
         if lcp < minimum_lcp:
             continue
-        if best is None or lcp > best[1]:
+        candidate_is_complete = lcp == len(candidate.tokens)
+        best_is_complete = best is not None and best[1] == len(best[0].tokens)
+        if best is None or (lcp, candidate_is_complete) > (best[1], best_is_complete):
             best = (candidate, lcp)
     return best
 

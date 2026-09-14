@@ -161,6 +161,20 @@ class CacheCoreTests(unittest.TestCase):
             with self.subTest(minimum=minimum), self.assertRaises(ValueError):
                 best_prefix_manifest(candidates, (1, 2), "private", "runtime-a", minimum)
 
+    def test_best_manifest_prefers_complete_candidate_when_lcp_ties(self):
+        divergent = PrefixManifest("private", "runtime-a", "divergent.bin", (1, 2, 3, 4))
+        complete = PrefixManifest("private", "runtime-a", "complete.bin", (1, 2, 3))
+
+        selected = best_prefix_manifest(
+            [divergent, complete],
+            (1, 2, 3, 9),
+            "private",
+            "runtime-a",
+            minimum_lcp=2,
+        )
+
+        self.assertEqual(selected, (complete, 3))
+
 
 if __name__ == "__main__":
     unittest.main()

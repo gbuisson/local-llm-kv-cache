@@ -180,11 +180,11 @@ local-llm-prefix-<hash>.bin.manifest.json
 1. 严格过滤到相同 `PI_LLAMA_CACHE_NAMESPACE` 和 `PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE`；
 2. 忽略 malformed、过大或 orphan manifest；
 3. 对每个候选与请求 token 从 index 0 开始逐项比较；
-4. 选择 exact LCP 最长、且 LCP 至少为 `PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS`（默认 `128`）的候选。
+4. 选择 exact LCP 最长、且 LCP 至少为 `PI_LLAMA_CACHE_MIN_SHARED_PREFIX_TOKENS`（默认 `128`）的候选；LCP 相同时优先选择自身完整包含在请求开头的较短候选。
 
 不使用 prompt 文本启发式、hash 相似度或匹配百分比。`PI_LLAMA_CACHE_SHARED_PREFIX_SCOPE` 必须按信任域显式配置；personal 与 work 必须使用不同值。模型/runtime/template 部署不兼容时还需轮换 namespace。
 
-成功 restore 后，请求被 pin 到该 slot。patched llama.cpp 的 native LCP 会保留第一处分歧之前的 KV/GDN 状态，并拒绝或截断其后的整个旧 suffix；代理不会自行拼接 KV。因此 skill、tool schema、system/developer prompt、memory、日期、template 或 reasoning mode 的改变只会得到较短 LCP（低于阈值则 cold），绝不允许跨过第一处分歧产生 stale hit。
+只有候选的全部 token 都是当前请求前缀时才允许 restore，并把请求 pin 到该 slot。候选在内部发生分歧时，代理不会依赖 llama.cpp 截断已恢复 snapshot：它保持 cold 路径，并在请求结束后 seed 严格相等的 `request_tokens[:verified_lcp]`。后续请求可完整 restore 这个较短的稳定 golden。代理不会自行拼接 KV；skill、tool schema、system/developer prompt、memory、日期、template 或 reasoning mode 的改变绝不允许跨过第一处分歧产生 stale hit。
 
 ## 5. 请求命中顺序
 
@@ -201,14 +201,16 @@ flowchart TD
     DS -->|yes and restore succeeds| DSR["Restore session snapshot"]
     DS -->|no or restore fails| RT["Native /apply-template + /tokenize"]
     RT --> SP{"Best same namespace+scope exact LCP >= minimum?"}
-    SP -->|yes and restore succeeds| SPR["Restore shared golden prefix"]
-    SP -->|no / malformed / API or restore failure| DP{"Legacy exact prefix exists?"}
+    SP -->|complete candidate and restore succeeds| SPR["Restore shared golden prefix"]
+    SP -->|internal divergence| OL["Cold request; seed verified LCP later"]
+    SP -->|no / malformed / API or restore failure| DP{"scope=default, no manifest, legacy exact prefix exists?"}
     DP -->|yes and restore succeeds| DPR["Restore legacy exact prefix"]
-    DP -->|no or restore fails| MISS["Cold / full prefill"]
+    DP -->|no, scoped, manifested, or restore fails| MISS["Cold / full prefill"]
 
     HS --> SEND["id_slot only for hot session"]
     DSR --> NATIVE["Restored slot pinned; cold unpinned<br/>native LCP"]
     SPR --> NATIVE
+    OL --> NATIVE
     DPR --> NATIVE
     MISS --> NATIVE
     NATIVE --> RESP

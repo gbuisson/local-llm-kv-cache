@@ -223,6 +223,7 @@ class SnapshotPlan:
     slot_task_ids: dict[int, int] = field(default_factory=dict)
     shared_prefix_candidate_tokens: int | None = None
     shared_prefix_verified_lcp: int | None = None
+    stable_prefix_seed_tokens: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,14 @@ class SlotState:
     n_tokens: int
     session_file: Path | None = None
     dirty: bool = False
+
+
+@dataclass(frozen=True)
+class PendingPrefixSeed:
+    prefix_payload: dict[str, Any]
+    prefix_file: Path
+    excluded_slot_id: int | None
+    stable_tokens: tuple[int, ...] | None
 
 
 class LlamaCacheProxy:
@@ -293,6 +302,7 @@ class LlamaCacheProxy:
         self.session_states: dict[str, SlotState] = {}
         self.prefix_seed_lock = threading.Lock()
         self.prefix_seeds_in_flight: set[Path] = set()
+        self.pending_prefix_seeds: dict[Path, PendingPrefixSeed] = {}
         self.foreground_waiters = 0
         self.foreground_waiters_lock = threading.Lock()
         self._prune()
@@ -310,6 +320,8 @@ class LlamaCacheProxy:
         shared_prefix_restored = False
         shared_prefix_candidate_tokens = None
         shared_prefix_verified_lcp = None
+        stable_prefix_seed_tokens = None
+        request_tokens: tuple[int, ...] = ()
         rejected_shared_source: Path | None = None
         if hot_state is not None:
             slot_id = hot_state.slot_id
@@ -340,31 +352,43 @@ class LlamaCacheProxy:
                     )
                 if shared is not None:
                     shared_source, candidate_tokens, verified_lcp = shared
-                    self._forget_slot(candidate_slot_id)
-                    restored_source = self._restore_first_available(
-                        candidate_slot_id,
-                        (shared_source,),
-                        session_ref=session_ref,
-                        expected_tokens=candidate_tokens,
-                        remove_on_count_mismatch=True,
-                    )
-                    if restored_source is not None:
-                        shared_prefix_restored = True
-                        shared_prefix_candidate_tokens = candidate_tokens
-                        shared_prefix_verified_lcp = verified_lcp
+                    if verified_lcp < candidate_tokens:
+                        stable_prefix_seed_tokens = request_tokens[:verified_lcp]
+                        rejected_shared_source = shared_source
                         _log_event(
-                            "shared_prefix_candidate_restored",
+                            "shared_prefix_overlap_discovered",
                             session_ref=session_ref,
-                            slot_id=candidate_slot_id,
                             candidate_tokens=candidate_tokens,
                             verified_lcp=verified_lcp,
                         )
                     else:
-                        rejected_shared_source = shared_source
+                        self._forget_slot(candidate_slot_id)
+                        restored_source = self._restore_first_available(
+                            candidate_slot_id,
+                            (shared_source,),
+                            session_ref=session_ref,
+                            expected_tokens=candidate_tokens,
+                            remove_on_count_mismatch=True,
+                        )
+                        if restored_source is not None:
+                            shared_prefix_restored = True
+                            shared_prefix_candidate_tokens = candidate_tokens
+                            shared_prefix_verified_lcp = verified_lcp
+                            _log_event(
+                                "shared_prefix_candidate_restored",
+                                session_ref=session_ref,
+                                slot_id=candidate_slot_id,
+                                candidate_tokens=candidate_tokens,
+                                verified_lcp=verified_lcp,
+                            )
+                        else:
+                            rejected_shared_source = shared_source
             if (
                 restored_source is None
+                and rejected_shared_source is None
+                and self.shared_prefix_scope == "default"
                 and prefix_file.exists()
-                and prefix_file != rejected_shared_source
+                and not prefix_file.with_name(manifest_filename(prefix_file.name)).exists()
             ):
                 self._forget_slot(candidate_slot_id)
                 restored_source = self._restore_first_available(
@@ -396,6 +420,7 @@ class LlamaCacheProxy:
             slot_task_ids=slot_task_ids,
             shared_prefix_candidate_tokens=shared_prefix_candidate_tokens,
             shared_prefix_verified_lcp=shared_prefix_verified_lcp,
+            stable_prefix_seed_tokens=stable_prefix_seed_tokens,
         )
         return with_slot_cache(body, slot_id), plan
 
@@ -614,6 +639,7 @@ class LlamaCacheProxy:
             plan.shared_prefix_candidate_tokens is not None and cached_tokens == 0
         ):
             self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
+        self._retry_pending_prefix_seeds()
         if did_save:
             self._prune()
 
@@ -695,18 +721,64 @@ class LlamaCacheProxy:
             return
         if not plan.prefix_payload.get("messages") and not plan.prefix_payload.get("tools"):
             return
+        pending = PendingPrefixSeed(
+            plan.prefix_payload,
+            plan.prefix_file,
+            plan.slot_id,
+            plan.stable_prefix_seed_tokens,
+        )
         with self.prefix_seed_lock:
-            if plan.prefix_file in self.prefix_seeds_in_flight:
+            existing = self.pending_prefix_seeds.get(plan.prefix_file)
+            if (
+                existing is not None
+                and existing.stable_tokens is not None
+                and (
+                    pending.stable_tokens is None
+                    or len(existing.stable_tokens) >= len(pending.stable_tokens)
+                )
+            ):
+                pending = replace(pending, stable_tokens=existing.stable_tokens)
+            self.pending_prefix_seeds[plan.prefix_file] = pending
+            while len(self.pending_prefix_seeds) > 16:
+                oldest = next(
+                    candidate
+                    for candidate in self.pending_prefix_seeds
+                    if candidate not in self.prefix_seeds_in_flight
+                )
+                self.pending_prefix_seeds.pop(oldest, None)
+        self._start_pending_prefix_seed(plan.prefix_file)
+
+    def _retry_pending_prefix_seeds(self) -> None:
+        with self.prefix_seed_lock:
+            pending_files = tuple(self.pending_prefix_seeds)
+        for prefix_file in pending_files:
+            self._start_pending_prefix_seed(prefix_file)
+
+    def _start_pending_prefix_seed(self, prefix_file: Path) -> None:
+        with self.prefix_seed_lock:
+            pending = self.pending_prefix_seeds.get(prefix_file)
+            if pending is None or prefix_file in self.prefix_seeds_in_flight:
                 return
-            self.prefix_seeds_in_flight.add(plan.prefix_file)
+            self.prefix_seeds_in_flight.add(prefix_file)
         threading.Thread(
             target=self._seed_prefix,
-            args=(plan.prefix_payload, plan.prefix_file, plan.slot_id),
+            args=(
+                pending.prefix_payload,
+                pending.prefix_file,
+                pending.excluded_slot_id,
+                pending.stable_tokens,
+            ),
             name="local-llm-kv-prefix-seed",
             daemon=True,
         ).start()
 
-    def _seed_prefix(self, prefix_payload: dict[str, Any], prefix_file: Path, excluded_slot_id: int) -> None:
+    def _seed_prefix(
+        self,
+        prefix_payload: dict[str, Any],
+        prefix_file: Path,
+        excluded_slot_id: int | None,
+        stable_tokens: tuple[int, ...] | None = None,
+    ) -> None:
         try:
             time.sleep(self.prefix_seed_delay_seconds)
             if self._has_foreground_waiters():
@@ -752,10 +824,14 @@ class LlamaCacheProxy:
                     ):
                         LOGGER.info("prefix seed skipped: no safe idle slot: %s", prefix_file.name)
                         return
+                    assert excluded_slot_id is not None
                     slot_id = excluded_slot_id
 
-                request = self._prefix_seed_payload(prefix_payload)
-                tokens = self._render_tokens(request)
+                if stable_tokens is None:
+                    request = self._prefix_seed_payload(prefix_payload)
+                    tokens = self._render_tokens(request)
+                else:
+                    tokens = normalize_tokens(stable_tokens)
                 published = self._published_shared_prefix(tokens)
                 if published is not None:
                     _log_event(
@@ -763,6 +839,7 @@ class LlamaCacheProxy:
                         filename=published.name,
                         tokens=len(tokens),
                     )
+                    self._discard_pending_prefix_seed(prefix_file, stable_tokens)
                     return
                 if self._has_foreground_waiters():
                     LOGGER.info("prefix seed skipped after discovery: foreground request is waiting: %s", prefix_file.name)
@@ -825,6 +902,7 @@ class LlamaCacheProxy:
                         seed_file.unlink(missing_ok=True)
                         manifest_path.unlink(missing_ok=True)
                         raise
+                    self._discard_pending_prefix_seed(prefix_file, stable_tokens)
                     if owner is None:
                         self._forget_slot(slot_id)
                 finally:
@@ -867,6 +945,16 @@ class LlamaCacheProxy:
         finally:
             with self.prefix_seed_lock:
                 self.prefix_seeds_in_flight.discard(prefix_file)
+
+    def _discard_pending_prefix_seed(
+        self,
+        prefix_file: Path,
+        stable_tokens: tuple[int, ...] | None,
+    ) -> None:
+        with self.prefix_seed_lock:
+            pending = self.pending_prefix_seeds.get(prefix_file)
+            if pending is not None and pending.stable_tokens == stable_tokens:
+                self.pending_prefix_seeds.pop(prefix_file, None)
 
     def _prefix_seed_target(self, prefix_file: Path) -> Path:
         """Keep a published pair immutable while a replacement pair is built."""
