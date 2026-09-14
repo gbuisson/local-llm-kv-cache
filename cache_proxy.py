@@ -221,6 +221,8 @@ class SnapshotPlan:
     prefix_was_present: bool
     candidate_slot_id: int | None = None
     slot_task_ids: dict[int, int] = field(default_factory=dict)
+    shared_prefix_candidate_tokens: int | None = None
+    shared_prefix_verified_lcp: int | None = None
 
 
 @dataclass(frozen=True)
@@ -306,6 +308,8 @@ class LlamaCacheProxy:
         candidate_slot_id = None
         slot_task_ids: dict[int, int] = {}
         shared_prefix_restored = False
+        shared_prefix_candidate_tokens = None
+        shared_prefix_verified_lcp = None
         rejected_shared_source: Path | None = None
         if hot_state is not None:
             slot_id = hot_state.slot_id
@@ -346,8 +350,10 @@ class LlamaCacheProxy:
                     )
                     if restored_source is not None:
                         shared_prefix_restored = True
+                        shared_prefix_candidate_tokens = candidate_tokens
+                        shared_prefix_verified_lcp = verified_lcp
                         _log_event(
-                            "shared_prefix_restore",
+                            "shared_prefix_candidate_restored",
                             session_ref=session_ref,
                             slot_id=candidate_slot_id,
                             candidate_tokens=candidate_tokens,
@@ -366,16 +372,10 @@ class LlamaCacheProxy:
                 )
             if restored_source is None:
                 _log_event("cache_miss", session_ref=session_ref, slot_id=candidate_slot_id)
-            else:
+            elif restored_source in (session_file, prefix_file):
                 _log_event(
                     "cache_hit",
-                    layer=(
-                        "session"
-                        if restored_source == session_file
-                        else "prefix"
-                        if restored_source == prefix_file
-                        else "shared_prefix"
-                    ),
+                    layer="session" if restored_source == session_file else "prefix",
                     session_ref=session_ref,
                     slot_id=candidate_slot_id,
                 )
@@ -394,6 +394,8 @@ class LlamaCacheProxy:
             prefix_was_present=shared_prefix_restored,
             candidate_slot_id=candidate_slot_id,
             slot_task_ids=slot_task_ids,
+            shared_prefix_candidate_tokens=shared_prefix_candidate_tokens,
+            shared_prefix_verified_lcp=shared_prefix_verified_lcp,
         )
         return with_slot_cache(body, slot_id), plan
 
@@ -411,8 +413,8 @@ class LlamaCacheProxy:
             raise TypeError("tokenize returned an invalid response")
         return normalize_tokens(tokenized.get("tokens"))
 
-    def _best_shared_prefix(self, request_tokens: tuple[int, ...]) -> tuple[Path, int, int] | None:
-        manifests: list[PrefixManifest] = []
+    def _shared_prefix_candidates(self) -> list[tuple[PrefixManifest, Path]]:
+        candidates: list[tuple[PrefixManifest, Path]] = []
         for path in self.cache_dir.glob("local-llm-prefix-*.bin.manifest.json"):
             try:
                 if path.stat().st_size > MAX_METADATA_BYTES:
@@ -421,11 +423,15 @@ class LlamaCacheProxy:
                 snapshot = self.cache_dir / manifest.snapshot
                 if path.name != f"{manifest.snapshot}.manifest.json" or not snapshot.is_file():
                     continue
-                manifests.append(manifest)
+                candidates.append((manifest, snapshot))
             except (OSError, ValueError):
                 continue
+        return candidates
+
+    def _best_shared_prefix(self, request_tokens: tuple[int, ...]) -> tuple[Path, int, int] | None:
+        candidates = self._shared_prefix_candidates()
         selected = best_prefix_manifest(
-            manifests,
+            [manifest for manifest, _snapshot in candidates],
             request_tokens,
             self.cache_namespace,
             self.shared_prefix_scope,
@@ -435,6 +441,16 @@ class LlamaCacheProxy:
             return None
         manifest, lcp = selected
         return self.cache_dir / manifest.snapshot, len(manifest.tokens), lcp
+
+    def _published_shared_prefix(self, tokens: tuple[int, ...]) -> Path | None:
+        for manifest, snapshot in self._shared_prefix_candidates():
+            if (
+                manifest.namespace == self.cache_namespace
+                and manifest.scope == self.shared_prefix_scope
+                and manifest.tokens == tokens
+            ):
+                return snapshot
+        return None
 
     @staticmethod
     def _touch_snapshot(source: Path) -> int | None:
@@ -578,6 +594,22 @@ class LlamaCacheProxy:
             cached_tokens=cached_tokens,
             snapshot_saved=did_save,
         )
+        if plan.shared_prefix_candidate_tokens is not None:
+            outcome = (
+                "shared_prefix_effective_hit"
+                if cached_tokens is not None and cached_tokens > 0
+                else "shared_prefix_rejected_by_llama"
+                if cached_tokens == 0
+                else "shared_prefix_effectiveness_unknown"
+            )
+            _log_event(
+                outcome,
+                session_ref=session_ref,
+                slot_id=slot_id,
+                candidate_tokens=plan.shared_prefix_candidate_tokens,
+                verified_lcp=plan.shared_prefix_verified_lcp,
+                cached_tokens=cached_tokens,
+            )
         if not plan.prefix_was_present:
             self._schedule_prefix_seed(replace(plan, slot_id=slot_id))
         if did_save:
@@ -722,6 +754,14 @@ class LlamaCacheProxy:
 
                 request = self._prefix_seed_payload(prefix_payload)
                 tokens = self._render_tokens(request)
+                published = self._published_shared_prefix(tokens)
+                if published is not None:
+                    _log_event(
+                        "prefix_seed_duplicate_skipped",
+                        filename=published.name,
+                        tokens=len(tokens),
+                    )
+                    return
                 if self._has_foreground_waiters():
                     LOGGER.info("prefix seed skipped after discovery: foreground request is waiting: %s", prefix_file.name)
                     return

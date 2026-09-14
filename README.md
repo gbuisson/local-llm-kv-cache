@@ -64,7 +64,7 @@ Streaming responses are relayed incrementally. The proxy reads one available ups
 
 The regression test `test_forward_streams_body_and_filters_hop_by_hop_headers` requires multiple upstream fragments to remain multiple downstream chunks and asserts that the forwarding path uses `read1`, not buffering `read`. A production timing probe should show the first `data:` event before the final event and a non-zero event-time spread during a multi-token generation.
 
-Operational events are emitted as compact JSON. Session identifiers、rendered prompt、token ID 数组和 manifest 内容都不会写入日志；`session_ref` 是可用于关联的截断 SHA-256。Shared-prefix 事件只记录候选 token 数和验证后的 LCP 长度等计数。
+Operational events are emitted as compact JSON. Session identifiers、rendered prompt、token ID 数组和 manifest 内容都不会写入日志；`session_ref` 是可用于关联的截断 SHA-256。Shared-prefix 事件只记录候选 token 数和验证后的 LCP 长度等计数。`shared_prefix_candidate_restored` 仅表示 snapshot 已恢复到 slot；响应 metadata 返回后才记录 `shared_prefix_effective_hit`（`cached_tokens > 0`）、`shared_prefix_rejected_by_llama`（`cached_tokens == 0`）或 `shared_prefix_effectiveness_unknown`（上游没有提供该计数）。Golden seed 在 render/tokenize 后会重新扫描有效 manifest；若相同 namespace、scope 和 exact token IDs 已发布，则记录 `prefix_seed_duplicate_skipped`，不会再次 prefill 或生成随机副本。
 
 ### Context compaction
 
@@ -358,12 +358,15 @@ curl -fsS http://127.0.0.1:18082/v1/models
 确认真正命中：
 
 ```text
-代理日志：cache_hit(layer=hot/session/shared_prefix/prefix)、shared_prefix_restore(candidate_tokens, verified_lcp)
+代理候选：shared_prefix_candidate_restored(candidate_tokens, verified_lcp)
+代理结果：shared_prefix_effective_hit(cached_tokens > 0)
+拒绝结果：shared_prefix_rejected_by_llama(cached_tokens == 0)
+其他缓存：cache_hit(layer=hot/session/prefix)
 API 响应：usage.prompt_tokens_details.cached_tokens > 0
 API timings：timings.cache_n > 0
 ```
 
-`shared_prefix_restore` 中的 `verified_lcp` 是代理在 manifest 与当前实际 token 间验证的长度；最终真正复用量仍以 llama.cpp 返回的 `cached_tokens` / `timings.cache_n` 为准。诊断 manifest 时不要打印可逆的 token 数组；下面只显示隔离域、token 数和 orphan 状态：
+`shared_prefix_candidate_restored` 中的 `verified_lcp` 是代理在 manifest 与当前实际 token 间验证的长度；它本身不是命中证明。最终真正复用量由响应后的 `shared_prefix_effective_hit` 以及 llama.cpp 返回的 `cached_tokens` / `timings.cache_n` 确认。诊断 manifest 时不要打印可逆的 token 数组；下面只显示隔离域、token 数和 orphan 状态：
 
 ```bash
 python3 - <<'PY'

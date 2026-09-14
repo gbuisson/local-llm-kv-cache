@@ -277,7 +277,8 @@ class CacheProxyTests(unittest.TestCase):
         self.proxy._json_request = Mock(side_effect=api)
         self.proxy._restore = Mock(return_value=4)
 
-        request, plan = self.proxy.prepare(self.body, "new-private-session")
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            request, plan = self.proxy.prepare(self.body, "new-private-session")
 
         self.assertEqual([call[0] for call in calls[:2]], ["/apply-template", "/tokenize"])
         self.assertEqual(calls[1][1], {"content": "rendered-private-prompt", "add_special": False, "parse_special": True})
@@ -285,11 +286,18 @@ class CacheProxyTests(unittest.TestCase):
         self.proxy._restore.assert_called_once_with(0, longest)
         self.assertNotEqual(longest, short)
         self.assertTrue(plan.prefix_was_present)
+        self.assertEqual(plan.shared_prefix_candidate_tokens, 4)
+        self.assertEqual(plan.shared_prefix_verified_lcp, 3)
+        rendered = str(log.call_args_list)
+        self.assertIn("shared_prefix_candidate_restored", rendered)
+        self.assertNotIn("shared_prefix_effective_hit", rendered)
+        self.assertNotIn("shared_prefix_rejected_by_llama", rendered)
+        self.assertNotIn('"cache_hit"', rendered)
 
     def test_shared_restore_prevents_exact_reseed_at_finish(self):
         self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
         self.proxy.minimum_shared_prefix_tokens = 2
-        self.proxy._render_tokens = Mock(return_value=(1, 2, 4))
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3, 4))
         self.proxy._restore = Mock(return_value=3)
         self.proxy._save = Mock(return_value=4)
         self.proxy._schedule_prefix_seed = Mock()
@@ -298,6 +306,32 @@ class CacheProxyTests(unittest.TestCase):
         self.proxy.finish(plan, 200)
 
         self.proxy._schedule_prefix_seed.assert_not_called()
+
+    def test_shared_candidate_logs_effective_outcome_only_after_llama_metadata(self):
+        plan = SnapshotPlan(
+            "session-a",
+            0,
+            "prefix",
+            Path(self.tempdir.name, "session.bin"),
+            Path(self.tempdir.name, "prefix.bin"),
+            {},
+            True,
+            shared_prefix_candidate_tokens=3,
+            shared_prefix_verified_lcp=3,
+        )
+        self.proxy._save = Mock(return_value=4)
+
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            self.proxy.finish(plan, 200, cached_tokens=3)
+        rendered = str(log.call_args_list)
+        self.assertIn("shared_prefix_effective_hit", rendered)
+        self.assertNotIn("shared_prefix_rejected_by_llama", rendered)
+
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            self.proxy.finish(plan, 200, cached_tokens=0)
+        rendered = str(log.call_args_list)
+        self.assertIn("shared_prefix_rejected_by_llama", rendered)
+        self.assertNotIn("shared_prefix_effective_hit", rendered)
 
     def test_shared_restore_requires_manifest_token_count(self):
         snapshot = self._write_shared("local-llm-prefix-shared.bin", [1, 2, 3])
@@ -1124,6 +1158,24 @@ class CacheProxyTests(unittest.TestCase):
         self.assertFalse(manifest_file.exists())
         self.assertNotIn(private_prompt, str(log.call_args_list))
         self.assertIn("prefix_seed_token_count_mismatch", str(log.call_args_list))
+
+    def test_prefix_seed_skips_tokens_already_published_in_valid_manifest(self):
+        self.proxy.prefix_seed_delay_seconds = 0
+        self.proxy._slots = Mock(return_value=[{"id": 0, "is_processing": False}])
+        self.proxy._render_tokens = Mock(return_value=(1, 2, 3))
+        existing = self._write_shared("local-llm-prefix-existing.bin", [1, 2, 3])
+        requested = Path(self.tempdir.name, "local-llm-prefix-requested.bin")
+        self.proxy._json_request = Mock()
+        self.proxy._save = Mock()
+
+        with patch.object(cache_proxy.LOGGER, "log") as log:
+            self.proxy._seed_prefix(self.body, requested, excluded_slot_id=1)
+
+        self.assertTrue(existing.exists())
+        self.assertFalse(requested.exists())
+        self.proxy._json_request.assert_not_called()
+        self.proxy._save.assert_not_called()
+        self.assertIn("prefix_seed_duplicate_skipped", str(log.call_args_list))
 
     def test_prefix_seed_stops_if_foreground_arrives_after_token_discovery(self):
         self.proxy.prefix_seed_delay_seconds = 0

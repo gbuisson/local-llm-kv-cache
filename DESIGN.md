@@ -375,7 +375,7 @@ prefix seed 使用：
 
 `/completion` seed 使用独立的 `PI_LLAMA_CACHE_PREFIX_SEED_TIMEOUT`（默认 600 秒），因为完整 prefix cold prefill 可以显著超过通用内部 API 的 120 秒 timeout。该值只作用于 seed completion；apply-template、tokenize、slot save/restore 等调用仍使用通用 timeout。超时仍走同一事务 rollback，且不会发布 manifest。
 
-dirty owner、缺失 snapshot、slot token mismatch、seed `n_saved` mismatch、前台等待、busy lock、render/tokenize/seed/save/manifest 失败都跳过或回滚，不影响前台正确性。已经按 shared 规则尝试并拒绝的文件，在同一次 `prepare` 中不得降级为无 token-count 校验的 legacy exact restore；即使 read-only filesystem 阻止物理删除，也必须继续 cold。成功恢复一个 shared golden 后，该请求不会因为日期等尾部小差异再创建一个近重复 exact snapshot。`PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=true` 可用于 `-np 1`；不再要求因为只有一个 slot 而禁用。首次 seed 仍支付一次额外 prefix prefill、snapshot I/O 和 manifest 写入成本。
+dirty owner、缺失 snapshot、slot token mismatch、seed `n_saved` mismatch、前台等待、busy lock、render/tokenize/seed/save/manifest 失败都跳过或回滚，不影响前台正确性。已经按 shared 规则尝试并拒绝的文件，在同一次 `prepare` 中不得降级为无 token-count 校验的 legacy exact restore；即使 read-only filesystem 阻止物理删除，也必须继续 cold。成功恢复一个 shared golden 后，该请求不会因为日期等尾部小差异再创建一个近重复 exact snapshot。每个后台 seed 在 render/tokenize 后还必须重新扫描有效 manifest；相同 namespace、scope 和 exact token IDs 已经发布时跳过 seed，防止多个请求在首个 golden 发布前排队并随后依次生成重复副本。`PI_LLAMA_CACHE_ENABLE_PREFIX_SEEDING=true` 可用于 `-np 1`；不再要求因为只有一个 slot 而禁用。首次 seed 仍支付一次额外 prefix prefill、snapshot I/O 和 manifest 写入成本。
 
 ## 9. 缓存不是答案缓存
 
@@ -452,7 +452,7 @@ shared discovery 的 `/apply-template`/`/tokenize` API 失败或 malformed respo
 - snapshot 与 manifest 都是私有数据。manifest 的 token IDs 可由同一 tokenizer detokenize，具有可逆性，不是匿名化 hash；目录必须保持 `0700`，snapshot/manifest 保持 `0600`，且 personal/work 使用不同 shared scope；
 - 结构化日志不得包含 prompt、rendered text、token IDs 或 manifest body，只记录 `session_ref`、layer、`candidate_tokens`、`verified_lcp`、时延和错误类型等元数据。
 
-运行验收必须包含 cold-vs-golden A/B：清除 prefix 文件，以禁用 seeding 的全新 session 测 cold；再启用 seeding，等待首个 seed 完成，并以不同 affinity 发出仅在较晚 skill/date/memory/suffix 处分歧的请求。要求 `cache_hit layer=shared_prefix`、`shared_prefix_restore.verified_lcp` 达标、API `cached_tokens`/`timings.cache_n > 0` 且 TTFT 改善；改变早期 token 时必须观察到更短 LCP 或 cold。运维 purge、只显示计数而不泄露 token 的 manifest 诊断和具体 systemd 命令见 [README.md](./README.md#运行和排查)。
+运行验收必须包含 cold-vs-golden A/B：清除 prefix 文件，以禁用 seeding 的全新 session 测 cold；再启用 seeding，等待首个 seed 完成，并以不同 affinity 发出仅在较晚 skill/date/memory/suffix 处分歧的请求。要求先有 `shared_prefix_candidate_restored`，再由响应 metadata 产生 `shared_prefix_effective_hit` 且 API `cached_tokens`/`timings.cache_n > 0`、TTFT 改善；`shared_prefix_rejected_by_llama` 表示 snapshot restore 成功但 native LCP 没有形成实际 KV hit，不能计为命中。改变早期 token 时必须观察到更短 LCP、rejected 或 cold。运维 purge、只显示计数而不泄露 token 的 manifest 诊断和具体 systemd 命令见 [README.md](./README.md#运行和排查)。
 
 ## 12. 关键文件
 
